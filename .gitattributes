@@ -1,0 +1,3 @@
+# This first backup preserves the verified Windows source bytes exactly.
+# Avoid implicit CRLF/LF rewriting when cloning with a different Git config.
+* -text

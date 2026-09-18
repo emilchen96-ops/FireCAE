@@ -1,0 +1,12 @@
+&HEAD CHID='solver_mpi8', TITLE='FireCAE eight-process MPI acceptance case' /
+&MESH ID='M1', IJK=4,4,4, XB=0,1,0,1,0,1 /
+&MESH ID='M2', IJK=4,4,4, XB=1,2,0,1,0,1 /
+&MESH ID='M3', IJK=4,4,4, XB=2,3,0,1,0,1 /
+&MESH ID='M4', IJK=4,4,4, XB=3,4,0,1,0,1 /
+&MESH ID='M5', IJK=4,4,4, XB=4,5,0,1,0,1 /
+&MESH ID='M6', IJK=4,4,4, XB=5,6,0,1,0,1 /
+&MESH ID='M7', IJK=4,4,4, XB=6,7,0,1,0,1 /
+&MESH ID='M8', IJK=4,4,4, XB=7,8,0,1,0,1 /
+&TIME T_END=0.05 /
+&DUMP NFRAMES=2 /
+&TAIL /

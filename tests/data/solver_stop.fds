@@ -1,0 +1,5 @@
+&HEAD CHID='solver_stop', TITLE='FireCAE active-stop acceptance case' /
+&MESH IJK=40,40,40, XB=0,4,0,4,0,4 /
+&TIME T_END=100.0 /
+&DUMP NFRAMES=2 /
+&TAIL /

@@ -1,0 +1,6 @@
+&HEAD CHID='solver_smoke', TITLE='FireCAE FDS runner smoke test' /
+&MESH IJK=4,4,4, XB=0.0,1.0,0.0,1.0,0.0,1.0 /
+&TIME T_END=0.1 /
+&DUMP NFRAMES=2 /
+&TAIL /
+

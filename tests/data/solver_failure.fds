@@ -1,0 +1,4 @@
+&HEAD CHID='solver_failure', TITLE='FireCAE expected failure acceptance case' /
+&MESH IJK=4,4,4, XB=0,1,0,1,0,1, NOT_A_REAL_PARAMETER=.TRUE. /
+&TIME T_END=0.1 /
+&TAIL /
