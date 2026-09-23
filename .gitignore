@@ -5,6 +5,12 @@
 /.vs/
 /.vscode/
 /CMakeUserPresets.json
+# Local UX acceptance evidence, installation records and machine-bound runner.
+/docs/acceptance/ux-*/
+/docs/UX_BATCH_A_REPORT_20260923.md
+/docs/UX_BATCH_BCD_REPORT_20260923.md
+/docs/UX_OPTIMIZATION_PROGRESS.md
+/tools/build_ux_batch_a.ps1
 *.user
 *.suo
 *.VC.db

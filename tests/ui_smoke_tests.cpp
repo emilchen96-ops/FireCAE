@@ -5251,8 +5251,8 @@ int main(int argc, char* argv[])
     if (!tree || tree->topLevelItemCount() != 1) {
         return fail("Project root was not created.");
     }
-    if (tree->indentation() != 16 || tree->textElideMode() != Qt::ElideMiddle ||
-        tree->horizontalScrollBarPolicy() != Qt::ScrollBarAlwaysOff ||
+    if (tree->indentation() != 12 || tree->textElideMode() != Qt::ElideMiddle ||
+        tree->horizontalScrollBarPolicy() != Qt::ScrollBarAsNeeded ||
         !window.findChild<QToolButton*>(QStringLiteral("ModelTreeCollapseAllButton")) ||
         !window.findChild<QToolButton*>(QStringLiteral("ModelTreeLocateSelectionButton"))) {
         return fail("The large-model tree navigation layout is incomplete.");

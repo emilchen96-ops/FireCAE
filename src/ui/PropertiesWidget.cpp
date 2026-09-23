@@ -207,6 +207,13 @@ void PropertiesWidget::showObject(const FcObject* object)
             rows.append({t("Schema:"), ifcObject->schema()});
         }
         rows.append({t("FDS Conversion:"), ifcObject->fdsConversionRoute()});
+        const QString appearanceSource = ifcObject->hasSourceAppearance()
+            ? (ifcObject->hasFallbackAppearance()
+                ? t("IFC source colors and type fallback colors")
+                : t("IFC source colors (converted)"))
+            : t("IFC type fallback colors (no source colors)");
+        rows.append({t("Display appearance:"), appearanceSource});
+        rows.append({t("Opacity:"), QString::number(ifcObject->appearance().alpha, 'g', 4)});
         if (object->type() == FcObjectType::IfcModel &&
             !ifcObject->sourceFile().isEmpty()) {
             rows.append({t("Source:"), ifcObject->sourceFile()});

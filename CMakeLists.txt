@@ -118,6 +118,10 @@ add_library(FireCAEFdsModel STATIC
     src/fds/FdsPropertyLibrary.cpp
     src/fds/FdsPropertyLibrary.h
     src/fds/FdsBlockConversionService.cpp
+    src/fds/GeometryDerivedUpdateService.cpp
+    src/fds/GeometryDerivedUpdateService.h
+    src/modeling/GeometryEditDependencyService.cpp
+    src/modeling/GeometryEditDependencyService.h
     src/fds/FdsBlockConversionService.h)
 target_link_libraries(FireCAEFdsModel PUBLIC FireCAECore Qt6::Core)
 target_include_directories(FireCAEFdsModel PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -141,6 +145,8 @@ add_library(FireCAEGeometry STATIC
     src/geometry/FcIfcObject.h
     src/modeling/BuildingGeometryService.cpp
     src/modeling/BuildingGeometryService.h
+    src/modeling/GeometryEditService.cpp
+    src/modeling/GeometryEditService.h
     src/modeling/SnapManager.cpp
     src/modeling/SnapManager.h)
 target_link_libraries(FireCAEGeometry
@@ -257,6 +263,8 @@ set(FIRECAE_UI_SOURCES
     src/ui/SmokeviewHostWidget.h
     src/ui/SimulationTaskCenterWidget.cpp
     src/ui/SimulationTaskCenterWidget.h
+    src/ui/SimulationStatusWidget.cpp
+    src/ui/SimulationStatusWidget.h
     src/ui/SimulationParametersDialog.cpp
     src/ui/SimulationParametersDialog.h
     src/ui/SimulationRunDialog.cpp
@@ -276,6 +284,14 @@ target_link_libraries(FireCAE PRIVATE
     FireCAEVisualization FireCAEImport FireCAEResults FireCAESimulation
     FireCAEResources FireCAEReliability FireCAEFdsModel Qt6::Concurrent)
 target_include_directories(FireCAE PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+set(FIRECAE_APPLICATION_OUTPUT_DIRECTORY "" CACHE PATH "Optional isolated application output directory")
+if(FIRECAE_APPLICATION_OUTPUT_DIRECTORY)
+    set_target_properties(FireCAE PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${FIRECAE_APPLICATION_OUTPUT_DIRECTORY}")
+endif()
+set(FIRECAE_BUILD_LABEL "" CACHE STRING "Optional visible build identifier")
+if(FIRECAE_BUILD_LABEL)
+    target_compile_definitions(FireCAE PRIVATE FIRECAE_BUILD_LABEL="${FIRECAE_BUILD_LABEL}")
+endif()
 
 add_executable(FireCAECoreTests tests/core_tests.cpp)
 target_link_libraries(FireCAECoreTests PRIVATE
@@ -400,6 +416,62 @@ set_tests_properties(FireCAEReacceptanceScenarioUiTests PROPERTIES TIMEOUT 60
 
 # No "Tests" in this executable basename: the isolated probe exercises the
 # production MainWindow settings restore/save path, which tests normally skip.
+add_executable(FireCAEUxLayoutProbe tests/ux_workspace_layout_tests.cpp ${FIRECAE_UI_SOURCES})
+target_link_libraries(FireCAEUxLayoutProbe PRIVATE
+    FireCAEVisualization FireCAEImport FireCAEResults FireCAESimulation
+    FireCAEResources FireCAEReliability FireCAEFdsModel Qt6::Concurrent user32)
+add_executable(FireCAEUxIfcAppearanceTests tests/ux_ifc_appearance_tests.cpp)
+target_link_libraries(FireCAEUxIfcAppearanceTests PRIVATE FireCAEVisualization FireCAEImport FireCAEFdsModel Qt6::Core)
+target_compile_definitions(FireCAEUxIfcAppearanceTests PRIVATE FIRECAE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+add_test(NAME FireCAEUxIfcAppearanceTests COMMAND FireCAEUxIfcAppearanceTests)
+set_tests_properties(FireCAEUxIfcAppearanceTests PROPERTIES TIMEOUT 180)
+add_executable(FireCAEUxGeometryEditTests tests/ux_geometry_edit_tests.cpp)
+add_executable(FireCAEUxSolverCase tests/ux_solver_case.cpp)
+target_link_libraries(FireCAEUxSolverCase PRIVATE FireCAEFdsModel FireCAEGeometry Qt6::Core)
+target_link_libraries(FireCAEUxGeometryEditTests PRIVATE FireCAEFdsModel FireCAEGeometry Qt6::Core)
+add_test(NAME FireCAEUxGeometryEditTests COMMAND FireCAEUxGeometryEditTests)
+add_executable(FireCAEUxGeometryDerivedUpdateTests tests/ux_geometry_derived_update_tests.cpp)
+target_link_libraries(FireCAEUxGeometryDerivedUpdateTests PRIVATE FireCAEFdsModel FireCAEGeometry Qt6::Core)
+add_test(NAME FireCAEUxGeometryDerivedUpdateTests COMMAND FireCAEUxGeometryDerivedUpdateTests)
+add_executable(FireCAEUxInteractionTests tests/ux_interaction_tests.cpp ${FIRECAE_UI_SOURCES})
+target_link_libraries(FireCAEUxInteractionTests PRIVATE
+    FireCAEVisualization FireCAEImport FireCAEResults FireCAESimulation
+    FireCAEResources FireCAEReliability FireCAEFdsModel Qt6::Concurrent user32)
+add_test(NAME FireCAEUxInteractionTests COMMAND FireCAEUxInteractionTests)
+set_tests_properties(FireCAEUxInteractionTests PROPERTIES TIMEOUT 90
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_PLATFORM_PLUGIN_PATH=${FIRECAE_ACCEPTANCE_QT_PLUGINS}/platforms")
+add_executable(FireCAEUxGeometryPropertiesTests tests/ux_geometry_properties_tests.cpp
+    src/ui/BuildingElementDialog.cpp src/ui/BuildingElementDialog.h src/ui/UiLanguage.cpp)
+target_link_libraries(FireCAEUxGeometryPropertiesTests PRIVATE FireCAEGeometry FireCAEFdsModel Qt6::Widgets)
+add_test(NAME FireCAEUxGeometryPropertiesTests COMMAND FireCAEUxGeometryPropertiesTests)
+set_tests_properties(FireCAEUxGeometryPropertiesTests PROPERTIES TIMEOUT 120
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_PLATFORM_PLUGIN_PATH=${FIRECAE_ACCEPTANCE_QT_PLUGINS}/platforms")
+if(MSVC)
+    foreach(target FireCAEUxIfcAppearanceTests FireCAEUxGeometryEditTests FireCAEUxGeometryPropertiesTests FireCAEUxInteractionTests FireCAEUxGeometryDerivedUpdateTests)
+        target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
+    endforeach()
+endif()
+add_executable(FireCAEUxModelTreeTests tests/ux_model_tree_tests.cpp
+    src/ui/ModelTreeWidget.cpp src/ui/ModelTreeWidget.h src/ui/UiLanguage.cpp)
+target_link_libraries(FireCAEUxModelTreeTests PRIVATE FireCAEGeometry FireCAEFdsModel Qt6::Widgets)
+add_executable(FireCAEGeometryImportLayoutTests tests/geometry_import_layout_tests.cpp
+    src/ui/GeometryImportWizard.cpp src/ui/GeometryImportWizard.h src/ui/UiLanguage.cpp)
+target_link_libraries(FireCAEGeometryImportLayoutTests PRIVATE FireCAEImport Qt6::Widgets Qt6::Concurrent)
+if(MSVC)
+    foreach(target FireCAEUxLayoutProbe FireCAEUxModelTreeTests FireCAEGeometryImportLayoutTests)
+        target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
+    endforeach()
+endif()
+add_test(NAME FireCAEUxWorkspaceLayoutTests COMMAND FireCAEUxLayoutProbe $<TARGET_FILE:FireCAEReacceptanceSolverFixture>)
+add_test(NAME FireCAEUxModelTreeTests COMMAND FireCAEUxModelTreeTests)
+set_tests_properties(FireCAEUxWorkspaceLayoutTests FireCAEUxModelTreeTests PROPERTIES TIMEOUT 90
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_PLATFORM_PLUGIN_PATH=${FIRECAE_ACCEPTANCE_QT_PLUGINS}/platforms")
+foreach(scale 1 1.25 1.5 2)
+    add_test(NAME FireCAEGeometryImportLayoutTests_${scale} COMMAND FireCAEGeometryImportLayoutTests)
+    set_tests_properties(FireCAEGeometryImportLayoutTests_${scale} PROPERTIES TIMEOUT 90
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_SCALE_FACTOR=${scale};QT_QPA_PLATFORM_PLUGIN_PATH=${FIRECAE_ACCEPTANCE_QT_PLUGINS}/platforms")
+endforeach()
+
 add_executable(FireCAEReacceptanceLayoutProbe
     tests/reacceptance_layout_tutorial_tests.cpp ${FIRECAE_UI_SOURCES})
 target_link_libraries(FireCAEReacceptanceLayoutProbe PRIVATE

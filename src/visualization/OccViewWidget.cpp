@@ -1,6 +1,13 @@
 #include "visualization/OccViewWidget.h"
 
 #include "visualization/GeometryDisplayManager.h"
+#include "ui/UiLanguage.h"
+#include <Geom_CartesianPoint.hxx>
+#include <Prs3d_PointAspect.hxx>
+#include <Prs3d_Drawer.hxx>
+#include <QInputDialog>
+#include <QApplication>
+#include <Graphic3d_ZLayerId.hxx>
 
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <gp_Ax2.hxx>
@@ -147,6 +154,8 @@ bool OccViewWidget::saveViewImage(const QString& filePath) const
 
 bool OccViewWidget::showTransformManipulator(const QStringList& objectIds)
 {
+    endDirectEditing();
+    cancelWallSketch();
     return m_displayManager && m_displayManager->attachManipulator(objectIds);
 }
 
@@ -171,6 +180,8 @@ void OccViewWidget::beginWallSketch(double elevation,
                                     double exactLength,
                                     double exactAngleDegrees)
 {
+    endDirectEditing();
+    hideTransformManipulator();
     cancelWallSketch();
     m_wallSketchElevation = elevation;
     m_wallSketchThickness = std::max(thickness, 1.0e-6);
@@ -246,14 +257,155 @@ void OccViewWidget::resizeEvent(QResizeEvent* event)
     scheduleViewerSizeSynchronization();
 }
 
+QString OccViewWidget::prepareContextSelection(const QPoint& position)
+{
+    if (!isInitialized() || !m_displayManager) return {};
+    const QPoint pixel = viewerPixelPosition(position);
+    const auto& context = m_viewer->context();
+    context->MoveTo(pixel.x(), pixel.y(), m_viewer->view(), Standard_True);
+    if (!context->HasDetected()) return {};
+    const QString id = m_displayManager->objectIdForPresentation(context->DetectedInteractive());
+    if (id.isEmpty()) return {};
+    if (!m_displayManager->selectedObjectIds().contains(id)) {
+        m_displayManager->selectObject(id);
+        emit objectsSelected({id});
+        emit objectSelected(id);
+    }
+    return id;
+}
+
+void OccViewWidget::showGeometryPreview(const TopoDS_Shape& shape)
+{
+    clearGeometryPreview();
+    if (!isInitialized() || shape.IsNull()) return;
+    m_geometryPreview = new AIS_Shape(shape);
+    m_geometryPreview->SetColor(Quantity_Color(1.0,0.65,0.0,Quantity_TOC_RGB));
+    m_geometryPreview->SetWidth(3.0);
+    m_viewer->context()->Display(m_geometryPreview, 0, -1, Standard_True);
+}
+
+void OccViewWidget::clearGeometryPreview()
+{
+    if (!m_geometryPreview.IsNull() && isInitialized())
+        m_viewer->context()->Remove(m_geometryPreview, Standard_True);
+    m_geometryPreview.Nullify();
+}
+
+QString OccViewWidget::directEditingObjectId() const { return m_directObjectId; }
+
+bool OccViewWidget::beginDirectEditing(const QString& id, const BuildingGeometryRequest& request,
+                                      double snapStep)
+{
+    endDirectEditing();
+    if (!isInitialized()) return false;
+    m_directHandles=GeometryEditService::handles(request);
+    if (m_directHandles.isEmpty()) return false;
+    cancelWallSketch(); hideTransformManipulator();
+    m_directObjectId=id; m_directBefore=request; m_directSnapStep=snapStep;
+    m_directWasPerspective=m_viewer->isPerspective();
+    m_viewer->setPerspective(false); // Linear projected displacements require orthographic view.
+    rebuildDirectHandles();
+    return true;
+}
+
+void OccViewWidget::rebuildDirectHandles()
+{
+    for (const auto& item:m_directPresentations) m_viewer->context()->Remove(item,Standard_False);
+    m_directPresentations.clear();
+    for (const auto& handle:m_directHandles) {
+        const auto& p=handle.position;
+        Handle(AIS_Point) point=new AIS_Point(new Geom_CartesianPoint(p[0],p[1],p[2]));
+        point->Attributes()->SetPointAspect(new Prs3d_PointAspect(Aspect_TOM_O,
+            Quantity_Color(1.0,0.5,0.0,Quantity_TOC_RGB),4.0));
+        point->SetZLayer(Graphic3d_ZLayerId_Topmost);
+        m_viewer->context()->Display(point,0,-1,Standard_False);
+        m_directPresentations.append(point);
+    }
+    m_viewer->redraw();
+}
+
+void OccViewWidget::endDirectEditing()
+{
+    const bool active=!m_directObjectId.isEmpty();
+    if (isInitialized()) {
+        for (const auto& item:m_directPresentations) m_viewer->context()->Remove(item,Standard_False);
+        if(active)m_viewer->setPerspective(m_directWasPerspective);
+    }
+    m_directPresentations.clear(); m_directHandles.clear(); m_directObjectId.clear();
+    m_directHandle=-1; m_directValid=false; clearGeometryPreview();
+    if (active && isInitialized()) m_viewer->redraw();
+    if (active) emit directEditEnded();
+}
+
+QPointF OccViewWidget::directHandleScreenPoint(int index) const
+{
+    const auto& h=m_directHandles[index];
+    int x=0,y=0;
+    m_viewer->view()->Convert(h.position[0],h.position[1],h.position[2],x,y);
+    QPointF point(x/devicePixelRatioF(),y/devicePixelRatioF());
+    return point;
+}
+
+int OccViewWidget::directHandleAt(const QPoint& position) const
+{
+    if (!isInitialized()) return -1;
+    int picked=-1; double best=14.0*14.0;
+    for (int i=0;i<m_directHandles.size();++i) {
+        const bool v=QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier);
+        const QString key=m_directHandles[i].key;
+        if((key.endsWith(QStringLiteral(":U")) && v) || (key.endsWith(QStringLiteral(":V")) && !v)) continue;
+        const QPointF d=directHandleScreenPoint(i)-position;
+        const double dist=d.x()*d.x()+d.y()*d.y();
+        if(dist<best) {best=dist;picked=i;}
+    }
+    return picked;
+}
+
+void OccViewWidget::mouseDoubleClickEvent(QMouseEvent* event)
+{
+    const int handle=directHandleAt(event->position().toPoint());
+    if (event->button()==Qt::LeftButton && handle>=0) {
+        m_directHandle=-1;
+        bool accepted=false;
+        const double delta=QInputDialog::getDouble(this,UiLanguageManager::text("Exact Handle Displacement"),
+            UiLanguageManager::text("Signed displacement (m); the opposite face stays fixed:"),
+            0.0,-1e6,1e6,6,&accepted);
+        if (accepted) {
+            QString error;
+            BuildingGeometryRequest draft;
+            if (GeometryEditService::moveHandle(m_directBefore,m_directHandles[handle].key,delta,0,&draft,&error))
+                emit geometryEditRequested(m_directObjectId,BuildingGeometryService::requestToParameters(draft));
+            else emit directEditStatus(UiLanguageManager::text(error));
+        }
+        event->accept(); return;
+    }
+    if (event->button() == Qt::LeftButton && !m_wallSketchActive && !m_manipulatorDragging) {
+        m_leftButtonPressed = false;
+        m_leftClickMoved = false;
+        if (m_selectionBand) m_selectionBand->hide();
+        const QString id = prepareContextSelection(event->position().toPoint());
+        if (!id.isEmpty()) emit objectActivated(id);
+        event->accept();
+        return;
+    }
+    QWidget::mouseDoubleClickEvent(event);
+}
+
 void OccViewWidget::mousePressEvent(QMouseEvent* event)
 {
+    if (m_directHandle >= 0) { event->accept(); return; }
     if (!isInitialized()) {
         QWidget::mousePressEvent(event);
         return;
     }
 
     if (event->button() == Qt::LeftButton) {
+        const int handle=directHandleAt(event->position().toPoint());
+        if (handle>=0) {
+            m_directHandle=handle; m_directStart=event->position().toPoint();
+            m_directDraft=m_directBefore; m_directValid=false;
+            event->accept(); return;
+        }
         if (m_wallSketchActive) {
             double worldX = 0.0;
             double worldY = 0.0;
@@ -316,6 +468,32 @@ void OccViewWidget::mouseMoveEvent(QMouseEvent* event)
         return;
     }
 
+    if (m_directHandle>=0) {
+        const auto& h=m_directHandles[m_directHandle];
+        int x0=0,y0=0,x1=0,y1=0;
+        const auto& p=h.position; const auto& d=h.direction;
+        m_viewer->view()->Convert(p[0],p[1],p[2],x0,y0);
+        m_viewer->view()->Convert(p[0]+d[0],p[1]+d[1],p[2]+d[2],x1,y1);
+        const QPointF axis((x1-x0)/devicePixelRatioF(),(y1-y0)/devicePixelRatioF());
+        const double length=axis.x()*axis.x()+axis.y()*axis.y();
+        const QPointF shift=event->position()-m_directStart;
+        if (length<1.0) {
+            m_directValid=false;
+            emit directEditStatus(UiLanguageManager::text("This handle points toward the camera. Rotate the view or double-click for exact input."));
+        } else {
+            const double delta=(shift.x()*axis.x()+shift.y()*axis.y())/length;
+            QString error;
+            m_directValid=GeometryEditService::moveHandle(m_directBefore,h.key,delta,m_directSnapStep,&m_directDraft,&error);
+            if (m_directValid) {
+                showGeometryPreview(BuildingGeometryService::createShape(m_directDraft));
+                emit directEditStatus(QStringLiteral("%1 | %2 %3 m | %4 %5 m | Esc")
+                    .arg(h.key,UiLanguageManager::text("Displacement"))
+                    .arg(m_directSnapStep>0 ? std::round(delta/m_directSnapStep)*m_directSnapStep : delta,0,'f',4)
+                    .arg(UiLanguageManager::text("Snap")).arg(m_directSnapStep,0,'g',4));
+            } else { clearGeometryPreview(); emit directEditStatus(UiLanguageManager::text(error)); }
+        }
+        event->accept(); return;
+    }
     if (m_wallSketchActive && m_wallSketchHasStart) {
         double worldX = 0.0;
         double worldY = 0.0;
@@ -356,6 +534,10 @@ void OccViewWidget::mouseMoveEvent(QMouseEvent* event)
             const QPoint viewerPosition = viewerPixelPosition(event->position().toPoint());
             m_displayManager->updateManipulatorDetection(
                 viewerPosition.x(), viewerPosition.y(), m_viewer->view());
+        } else if (m_displayManager) {
+            const QPoint viewerPosition = viewerPixelPosition(event->position().toPoint());
+            m_viewer->context()->MoveTo(viewerPosition.x(), viewerPosition.y(),
+                                       m_viewer->view(), Standard_True);
         }
         QWidget::mouseMoveEvent(event);
         return;
@@ -376,6 +558,12 @@ void OccViewWidget::mouseMoveEvent(QMouseEvent* event)
 
 void OccViewWidget::mouseReleaseEvent(QMouseEvent* event)
 {
+    if(event->button()==Qt::LeftButton && m_directHandle>=0) {
+        const bool commit=m_directValid && (event->position().toPoint()-m_directStart).manhattanLength()>2;
+        m_directHandle=-1; clearGeometryPreview();
+        if(commit) emit geometryEditRequested(m_directObjectId,BuildingGeometryService::requestToParameters(m_directDraft));
+        event->accept(); return;
+    }
     if (event->button() == Qt::LeftButton && m_manipulatorDragging) {
         m_manipulatorDragging = false;
         if (m_displayManager) {
@@ -434,6 +622,9 @@ void OccViewWidget::keyPressEvent(QKeyEvent* event)
         return;
     }
     if (event->key() == Qt::Key_Escape) {
+        if(!m_directObjectId.isEmpty()) {
+            endDirectEditing(); event->accept(); return;
+        }
         if (m_wallSketchActive) {
             cancelWallSketch();
             event->accept();
@@ -453,6 +644,8 @@ void OccViewWidget::keyPressEvent(QKeyEvent* event)
 
 void OccViewWidget::wheelEvent(QWheelEvent* event)
 {
+    // Keep the projection fixed for the duration of a handle displacement.
+    if (m_directHandle >= 0) { event->accept(); return; }
     if (!isInitialized()) {
         QWidget::wheelEvent(event);
         return;

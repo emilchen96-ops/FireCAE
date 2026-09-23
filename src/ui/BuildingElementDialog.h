@@ -17,9 +17,15 @@ class QGroupBox;
 class QLabel;
 class QLineEdit;
 class QSpinBox;
+class QTabWidget;
+class QTableWidget;
+class QDialogButtonBox;
+class QPushButton;
+class QVBoxLayout;
 
 class BuildingElementDialog final : public QDialog
 {
+    Q_OBJECT
 public:
     BuildingElementDialog(FcGeometryKind initialKind,
                           FcProject* project,
@@ -34,6 +40,14 @@ public:
     QString surfaceObjectId() const;
     QMap<QString, QString> faceSurfaceIds() const;
     bool dynamicOpening() const;
+    QString groupObjectId() const;
+    QString description() const;
+    void setReadOnly(const QString& reason);
+    bool validateInput(QString* error = nullptr) const;
+
+signals:
+    void facePreviewRequested(const QString& faceKey);
+    void geometryPreviewRequested(const TopoDS_Shape& shape);
 
 protected:
     void accept() override;
@@ -46,6 +60,11 @@ private:
                                    const QMap<QString, QString>& assignments = {});
     void populateSurfaceCombo(QComboBox* combo, bool inheritDefault) const;
     void handleBaselineChanged();
+    void populateProfileTable(const BuildingGeometryRequest& request);
+    void populateMetadata(const QVariantMap& parameters);
+    QVariantMap additionalFields(QString* error = nullptr) const;
+    void updateColorButton();
+    void addTableTools(QTableWidget* table, QVBoxLayout* layout, bool orderable);
     QVector<QPointF> parsePoints(const QString& text) const;
     QString formatPoints(const QVector<QPointF>& points) const;
     double fromDisplay(double value) const;
@@ -53,6 +72,33 @@ private:
 
     FcProject* m_project = nullptr;
     QLineEdit* m_nameEdit = nullptr;
+    QFormLayout* m_geometryForm = nullptr;
+    QLineEdit* m_description = nullptr;
+    QComboBox* m_groupCombo = nullptr;
+    QTabWidget* m_tabs = nullptr;
+    QDialogButtonBox* m_buttons = nullptr;
+    QLabel* m_readOnlyReason = nullptr;
+    QLabel* m_bounds = nullptr;
+    QCheckBox* m_customColor = nullptr;
+    QPushButton* m_colorButton = nullptr;
+    QCheckBox* m_outline = nullptr;
+    QString m_color = QStringLiteral("#d1d6e0");
+    QTableWidget* m_profileTable = nullptr;
+    QTableWidget* m_advancedTable = nullptr;
+    QComboBox* m_extrusionMode = nullptr;
+    QDoubleSpinBox* m_extrusionDistance = nullptr;
+    QDoubleSpinBox* m_direction[3] = {nullptr, nullptr, nullptr};
+    QDoubleSpinBox* m_rotation = nullptr;
+    QGroupBox* m_profileGroup = nullptr;
+    QComboBox* m_surfaceMode = nullptr;
+    QMap<QString, QCheckBox*> m_physicsChecks;
+    QCheckBox* m_densityEnabled = nullptr;
+    QDoubleSpinBox* m_density = nullptr;
+    QVariantMap m_extraParameters;
+    QMap<QString, QString> m_unresolvedFaces;
+    bool m_updatingProfile = false;
+    bool m_spatialProfile = false;
+    bool m_readOnly = false;
     QComboBox* m_kindCombo = nullptr;
     QDoubleSpinBox* m_x = nullptr;
     QDoubleSpinBox* m_y = nullptr;

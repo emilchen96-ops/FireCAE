@@ -14,6 +14,8 @@
 #include <QVector>
 
 #include <memory>
+#include <array>
+#include <gp_Pnt.hxx>
 
 class FcGeometryObject;
 class FcIfcObject;
@@ -26,6 +28,7 @@ struct GeometryDisplayStyle
     double transparency = 0.0;
     bool wireframe = false;
     bool visible = true;
+    bool outline = false;
 };
 
 class GeometryDisplayManager final
@@ -41,6 +44,10 @@ public:
                      const TopoDS_Shape& shape,
                      const GeometryDisplayStyle& style = {});
     bool displayIfcModel(const std::shared_ptr<FcIfcObject>& rootObject);
+    // No viewer/window is needed to create or inspect the display data.
+    static Handle(AIS_Shape) createIfcPresentation(const FcIfcObject& object);
+    static QVector<std::array<gp_Pnt, 2>> ifcFeatureEdges(
+        const TopoDS_Shape& shape, double creaseAngleDegrees = 30.0);
     bool hideObject(const QString& objectId);
     bool showObject(const QString& objectId);
     bool selectObject(const QString& objectId);

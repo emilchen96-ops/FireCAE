@@ -1,4 +1,7 @@
 #pragma once
+#include "modeling/GeometryEditService.h"
+#include <AIS_Shape.hxx>
+#include <AIS_Point.hxx>
 
 #include "visualization/OccViewer.h"
 
@@ -44,6 +47,15 @@ public:
     bool restoreView();
     void setRotationCenter(double x, double y, double z);
     bool fitSelection();
+    // Hit-test without replacing an existing multi-selection when its member
+    // is right-clicked. Blank space retains selection but returns an empty ID.
+    QString prepareContextSelection(const QPoint& position);
+    void showGeometryPreview(const TopoDS_Shape& shape);
+    void clearGeometryPreview();
+    bool beginDirectEditing(const QString& objectId, const BuildingGeometryRequest& request,
+                            double snapStep = 0.0);
+    void endDirectEditing();
+    QString directEditingObjectId() const;
     void setClippingPlane(bool enabled, int axis, double position);
     void setClippingBox(bool enabled, double xMin, double xMax,
                         double yMin, double yMax, double zMin, double zMax);
@@ -67,6 +79,10 @@ public:
     bool isWallSketchActive() const;
 
 signals:
+    void objectActivated(const QString& objectId);
+    void geometryEditRequested(const QString& objectId, const QVariantMap& parameters);
+    void directEditStatus(const QString& text);
+    void directEditEnded();
     void viewerInitializationFinished(bool success);
     void objectSelected(const QString& objectId);
     void objectsSelected(const QStringList& objectIds);
@@ -84,6 +100,7 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
@@ -108,6 +125,9 @@ private:
     void constrainWallSketchEndpoint(double& endX, double& endY,
                                      Qt::KeyboardModifiers modifiers) const;
     bool commitWallSketchSegment(double endX, double endY, bool finishAfter);
+    int directHandleAt(const QPoint& position) const;
+    QPointF directHandleScreenPoint(int index) const;
+    void rebuildDirectHandles();
 
     std::unique_ptr<OccViewer> m_viewer;
     std::unique_ptr<GeometryDisplayManager> m_displayManager;
@@ -138,4 +158,15 @@ private:
     QVector<QPointF> m_wallSketchSnapPoints;
     QRubberBand* m_selectionBand = nullptr;
     bool m_initializationAttempted = false;
+    Handle(AIS_Shape) m_geometryPreview;
+    QVector<Handle(AIS_Point)> m_directPresentations;
+    QVector<GeometryEditHandle> m_directHandles;
+    QString m_directObjectId;
+    BuildingGeometryRequest m_directBefore;
+    BuildingGeometryRequest m_directDraft;
+    int m_directHandle = -1;
+    QPoint m_directStart;
+    double m_directSnapStep = 0.0;
+    bool m_directValid = false;
+    bool m_directWasPerspective = false;
 };

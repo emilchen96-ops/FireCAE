@@ -4,6 +4,9 @@
 #include <QList>
 #include <QString>
 #include <QStringList>
+#include <QVariantMap>
+#include <QMap>
+#include <gp_Trsf.hxx>
 
 #include <memory>
 
@@ -26,9 +29,11 @@ enum class FdsRunMode;
 enum class SmokeviewLaunchMode;
 enum class UiLanguage;
 struct ApplicationSettings;
+struct BuildingGeometryRequest;
 
 class SimulationTaskManager;
 class SimulationTaskCenterWidget;
+class SimulationStatusWidget;
 class FdsSceneSynchronizer;
 struct FdsRunSummary;
 struct FcProjectRuntimeSettings;
@@ -81,6 +86,11 @@ public:
     bool saveProjectFile(const QString& filePath);
     bool exportCurrentProjectToFds(const QString& filePath);
     void setInterfaceLanguage(UiLanguage language);
+    // Shared command construction for the live view and offscreen regression.
+    QMenu* createModelContextMenu(const QStringList& objectIds);
+    void openObjectProperties(const QString& objectId);
+    bool commitGeometryParameters(const QString& objectId, const QVariantMap& parameters,
+                                  QString* error = nullptr, bool validateOnly = false);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -131,6 +141,13 @@ private:
                                       double endX, double endY);
     void editSelectedBuildingGeometry();
     void editBuildingGeometry(const QString& objectId);
+    bool applyBuildingGeometryEdit(const QString& objectId, BuildingGeometryRequest request,
+        const QString& name, const QString& host, const QString& control,
+        const QString& surface, const QMap<QString, QString>& faces, bool dynamic,
+        const QString& groupId, QString* error, bool validateOnly = false);
+    bool commitParametricTransforms(const QStringList& ids, const QVector<gp_Trsf>& transforms);
+    void connectGeometryPreview(class BuildingElementDialog& dialog);
+    void toggleDirectGeometryEditing(bool enabled);
     void previewFdsBlocks();
     void convertBuildingGeometryToFds();
     void healSelectedGeometry();
@@ -207,6 +224,8 @@ private:
                          const QString& selectedObjectId = {});
     void setObjectVisibility(const QString& objectId, bool visible);
     void isolateObject(const QString& objectId);
+    void isolateObjects(const QStringList& objectIds);
+    void showAllObjects();
     void restoreModelVisibility();
     void viewNormalToObject(const QString& objectId);
     void updateWindowTitle();
@@ -288,6 +307,7 @@ private:
     QAction* m_resetLayoutAction = nullptr;
 
     QAction* m_createBoxAction = nullptr;
+    QAction* m_directEditAction = nullptr;
     QAction* m_createWallAction = nullptr;
     QAction* m_drawWallAction = nullptr;
     QAction* m_createRoomAction = nullptr;
@@ -376,6 +396,7 @@ private:
     QMenu* m_languageMenu = nullptr;
     QMenu* m_helpMenu = nullptr;
     QToolBar* m_mainToolBar = nullptr;
+    QToolBar* m_modelingToolBar = nullptr;
     QStackedWidget* m_centralStack = nullptr;
     QTabWidget* m_workspaceTabs = nullptr;
 
@@ -392,6 +413,7 @@ private:
     PropertiesWidget* m_propertiesWidget = nullptr;
     MessageWidget* m_messageWidget = nullptr;
     SimulationTaskCenterWidget* m_taskCenterWidget = nullptr;
+    SimulationStatusWidget* m_simulationStatusWidget = nullptr;
     QTabWidget* m_inspectorTabs = nullptr;
     QLabel* m_activeToolLabel = nullptr;
     QListWidget* m_selectionList = nullptr;

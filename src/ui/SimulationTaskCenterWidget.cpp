@@ -15,6 +15,8 @@
 #include <QScrollBar>
 #include <QTableWidget>
 #include <QTabWidget>
+#include <QToolButton>
+#include <QSignalBlocker>
 #include <QUrl>
 #include <QVBoxLayout>
 
@@ -36,13 +38,29 @@ SimulationTaskCenterWidget::SimulationTaskCenterWidget(QWidget* parent) : QWidge
     m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_table->verticalHeader()->hide();
     m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    m_table->setMinimumHeight(85);
     root->addWidget(m_table, 2);
-    auto* details = new QWidget(this);
+    m_failureSummary = new QLabel(this);
+    m_failureSummary->setObjectName(QStringLiteral("SimulationTaskFailureSummary"));
+    m_failureSummary->setWordWrap(true);
+    m_failureSummary->setTextFormat(Qt::PlainText);
+    root->addWidget(m_failureSummary);
+    m_detailsToggle = new QToolButton(this);
+    m_detailsToggle->setObjectName(QStringLiteral("SimulationTaskDetailsToggle"));
+    m_detailsToggle->setCheckable(true);
+    m_detailsToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    root->addWidget(m_detailsToggle, 0, Qt::AlignLeft);
+    m_details = new QWidget(this);
+    m_details->setObjectName(QStringLiteral("SimulationTaskDetails"));
+    auto* detailLayout = new QVBoxLayout(m_details);
+    detailLayout->setContentsMargins(0, 0, 0, 0);
+    auto* details = new QWidget(m_details);
     auto* detailsForm = new QFormLayout(details);
     detailsForm->setContentsMargins(0, 0, 0, 0);
     m_environmentCheck = new QLabel(details);
     m_environmentCheck->setObjectName(QStringLiteral("SimulationTaskEnvironmentCheck"));
     m_environmentCheck->setWordWrap(true);
+    m_environmentCheck->setTextFormat(Qt::PlainText);
     m_commandPreview = new QPlainTextEdit(details);
     m_commandPreview->setObjectName(QStringLiteral("SimulationTaskCommandPreview"));
     m_commandPreview->setReadOnly(true);
@@ -53,8 +71,8 @@ SimulationTaskCenterWidget::SimulationTaskCenterWidget(QWidget* parent) : QWidge
     m_commandLabel->setObjectName(QStringLiteral("SimulationTaskCommandLabel"));
     detailsForm->addRow(m_environmentLabel, m_environmentCheck);
     detailsForm->addRow(m_commandLabel, m_commandPreview);
-    root->addWidget(details);
-    m_outputTabs = new QTabWidget(this);
+    detailLayout->addWidget(details);
+    m_outputTabs = new QTabWidget(m_details);
     m_outputTabs->setObjectName(QStringLiteral("SimulationTaskOutputTabs"));
     m_log = new QPlainTextEdit(m_outputTabs);
     m_log->setObjectName(QStringLiteral("SimulationTaskLog"));
@@ -73,7 +91,11 @@ SimulationTaskCenterWidget::SimulationTaskCenterWidget(QWidget* parent) : QWidge
     // Keep raw stdout/stderr widgets populated for diagnostics and automated
     // support collection, while presenting users with one chronological log.
     m_outputTabs->addTab(m_log, u("Run Log"));
-    root->addWidget(m_outputTabs, 1);
+    detailLayout->addWidget(m_outputTabs, 1);
+    root->addWidget(m_details, 1);
+    connect(m_detailsToggle, &QToolButton::toggled,
+            this, &SimulationTaskCenterWidget::setDetailsExpanded);
+    setDetailsExpanded(false);
     auto* tools = new QHBoxLayout;
     m_cancel = new QPushButton(this);
     m_cancel->setObjectName(QStringLiteral("SimulationTaskCancelButton"));
@@ -142,10 +164,36 @@ QString SimulationTaskCenterWidget::selectedTaskId() const
     return item ? item->data(Qt::UserRole).toString() : QString{};
 }
 
+bool SimulationTaskCenterWidget::selectTaskById(const QString& taskId)
+{
+    for (int row = 0; row < m_table->rowCount(); ++row) {
+        const auto* item = m_table->item(row, 0);
+        if (item && item->data(Qt::UserRole).toString() == taskId) {
+            m_table->selectRow(row);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SimulationTaskCenterWidget::detailsExpanded() const
+{
+    return m_detailsToggle->isChecked();
+}
+
+void SimulationTaskCenterWidget::setDetailsExpanded(bool expanded)
+{
+    const QSignalBlocker blocker(m_detailsToggle);
+    m_detailsToggle->setChecked(expanded);
+    m_detailsToggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+    m_details->setVisible(expanded);
+}
+
 void SimulationTaskCenterWidget::retranslateUi()
 {
     m_environmentLabel->setText(u("Environment:"));
     m_commandLabel->setText(u("Command preview:"));
+    m_detailsToggle->setText(u("Run details (environment, command and log)"));
     m_table->setHorizontalHeaderLabels({u("State"), u("Project / CHID"), u("Scene"),
                                         u("Solver"), u("Processes"), u("Threads"),
                                         u("Started"), u("FDS Time"), u("Elapsed"),
@@ -168,15 +216,22 @@ void SimulationTaskCenterWidget::retranslateUi()
                 item->setText(UiLanguageManager::text(simulationTaskStateName(task->state)));
             }
         }
+        if (const auto* task = m_manager->task(selectedTaskId())) {
+            m_failureSummary->setText(u("Task failed. Open run details for the full log.") +
+                (task->errorMessage.isEmpty() ? QString{} : QStringLiteral("\n") + task->errorMessage.left(400)));
+        }
     }
 }
 
 void SimulationTaskCenterWidget::refresh()
 {
+    const QSignalBlocker selectionBlocker(m_table);
     const QString previous = selectedTaskId();
     const QVector<SimulationTaskRecord> tasks = m_manager
                                                     ? m_manager->tasks()
                                                     : QVector<SimulationTaskRecord>{};
+    const int horizontalPosition = m_table->horizontalScrollBar()->value();
+    const int verticalPosition = m_table->verticalScrollBar()->value();
     m_table->setRowCount(tasks.size());
     for (int row = 0; row < tasks.size(); ++row) {
         const SimulationTaskRecord& task = tasks[row];
@@ -211,6 +266,8 @@ void SimulationTaskCenterWidget::refresh()
     if (m_table->currentRow() < 0 && m_table->rowCount() > 0) {
         m_table->selectRow(m_table->rowCount() - 1);
     }
+    m_table->horizontalScrollBar()->setValue(horizontalPosition);
+    m_table->verticalScrollBar()->setValue(verticalPosition);
     refreshDetails();
 }
 
@@ -220,6 +277,7 @@ void SimulationTaskCenterWidget::refreshDetails()
                                            ? m_manager->task(selectedTaskId())
                                            : nullptr;
     if (!task) {
+        m_failureSummary->hide();
         m_log->clear();
         m_standardOutput->clear();
         m_standardError->clear();
@@ -228,13 +286,25 @@ void SimulationTaskCenterWidget::refreshDetails()
         m_cancel->setEnabled(false); m_retry->setEnabled(false);
         m_openFolder->setEnabled(false); m_openResults->setEnabled(false); return;
     }
-    m_log->setPlainText(task->log.isEmpty() ? task->errorMessage : task->log);
+    const bool failed = task->state == SimulationTaskState::Failed;
+    m_failureSummary->setVisible(failed);
+    m_failureSummary->setText(u("Task failed. Open run details for the full log.") +
+        (task->errorMessage.isEmpty() ? QString{} : QStringLiteral("\n") + task->errorMessage.left(400)));
+    m_failureSummary->setToolTip(task->errorMessage);
+    const auto updateLog = [](QPlainTextEdit* editor, const QString& text) {
+        if (editor->toPlainText() == text) return;
+        auto* scroll = editor->verticalScrollBar();
+        const int position = scroll->value();
+        const bool followTail = position == scroll->maximum();
+        editor->setPlainText(text);
+        scroll->setValue(followTail ? scroll->maximum() : position);
+    };
+    updateLog(m_log, task->log.isEmpty() ? task->errorMessage : task->log);
     m_standardOutput->setPlainText(task->standardOutput);
     m_standardError->setPlainText(
         task->standardError.isEmpty() ? task->errorMessage : task->standardError);
     m_commandPreview->setPlainText(task->commandLine);
     m_environmentCheck->setText(task->environmentCheck);
-    m_log->verticalScrollBar()->setValue(m_log->verticalScrollBar()->maximum());
     const bool active = task->state == SimulationTaskState::Waiting ||
                         task->state == SimulationTaskState::Preparing ||
                         task->state == SimulationTaskState::Running;

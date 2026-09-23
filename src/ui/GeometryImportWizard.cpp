@@ -19,6 +19,8 @@
 #include <QPointer>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QScrollArea>
+#include <QTextOption>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 #include <QWizardPage>
@@ -41,6 +43,30 @@ QDoubleSpinBox* coordinateSpin(QWidget* parent)
     value->setSuffix(QStringLiteral(" m"));
     return value;
 }
+
+QLabel* pageDescription(const QString& text, const QString& objectName, QWidget* parent)
+{
+    auto* label = new QLabel(text, parent);
+    label->setObjectName(objectName);
+    label->setTextFormat(Qt::PlainText);
+    label->setWordWrap(true);
+    label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    return label;
+}
+
+QFormLayout* scrollableForm(QVBoxLayout* pageLayout, const QString& objectName)
+{
+    auto* scroll = new QScrollArea(pageLayout->parentWidget());
+    scroll->setObjectName(objectName);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto* contents = new QWidget(scroll);
+    auto* form = new QFormLayout(contents);
+    form->setRowWrapPolicy(QFormLayout::WrapLongRows);
+    scroll->setWidget(contents);
+    pageLayout->addWidget(scroll, 1);
+    return form;
+}
 }
 
 GeometryImportWizard::GeometryImportWizard(const QString& initialFilePath,
@@ -49,13 +75,22 @@ GeometryImportWizard::GeometryImportWizard(const QString& initialFilePath,
 {
     setObjectName(QStringLiteral("GeometryImportWizard"));
     setWindowTitle(uiText("Import IFC/CAD/BIM Geometry"));
+    // Keep titles in Qt's layout-managed header on every platform, independent
+    // of the native Windows wizard title paint path and its theme metrics.
+    setWizardStyle(QWizard::ModernStyle);
+    setTitleFormat(Qt::PlainText);
+    setSubTitleFormat(Qt::PlainText);
     setOption(QWizard::NoBackButtonOnStartPage);
     resize(760, 560);
 
     auto* filePage = new QWizardPage(this);
     filePage->setTitle(uiText("Select geometry file"));
-    filePage->setSubTitle(uiText("FireCAE detects the format from the extension and reports unavailable plug-ins explicitly."));
     auto* fileLayout = new QVBoxLayout(filePage);
+    // Descriptions belong to the page layout so their height follows the actual
+    // available width after resize, including large application fonts.
+    fileLayout->addWidget(pageDescription(
+        uiText("FireCAE detects the format from the extension and reports unavailable plug-ins explicitly."),
+        QStringLiteral("GeometryImportFileDescription"), filePage));
     auto* fileRow = new QHBoxLayout();
     m_filePath = new QLineEdit(initialFilePath, filePage);
     m_filePath->setObjectName(QStringLiteral("GeometryImportFileEdit"));
@@ -75,8 +110,13 @@ GeometryImportWizard::GeometryImportWizard(const QString& initialFilePath,
 
     auto* coordinatePage = new QWizardPage(this);
     coordinatePage->setTitle(uiText("Units and coordinates"));
-    coordinatePage->setSubTitle(uiText("All imported geometry is stored in metres with Z as the FireCAE vertical axis."));
-    auto* coordinateForm = new QFormLayout(coordinatePage);
+    auto* coordinateLayout = new QVBoxLayout(coordinatePage);
+    coordinateLayout->setContentsMargins(0, 0, 0, 0);
+    coordinateLayout->addWidget(pageDescription(
+        uiText("All imported geometry is stored in metres with Z as the FireCAE vertical axis."),
+        QStringLiteral("GeometryImportCoordinateDescription"), coordinatePage));
+    auto* coordinateForm = scrollableForm(
+        coordinateLayout, QStringLiteral("GeometryImportCoordinateScroll"));
     m_unit = new QComboBox(coordinatePage);
     m_unit->setObjectName(QStringLiteral("GeometryImportUnitCombo"));
     m_unit->addItem(uiText("Auto"), QStringLiteral("Auto"));
@@ -109,7 +149,10 @@ GeometryImportWizard::GeometryImportWizard(const QString& initialFilePath,
 
     auto* qualityPage = new QWizardPage(this);
     qualityPage->setTitle(uiText("Geometry quality and structure"));
-    auto* qualityForm = new QFormLayout(qualityPage);
+    auto* qualityLayout = new QVBoxLayout(qualityPage);
+    qualityLayout->setContentsMargins(0, 0, 0, 0);
+    auto* qualityForm = scrollableForm(
+        qualityLayout, QStringLiteral("GeometryImportQualityScroll"));
     m_linearDeflection = new QDoubleSpinBox(qualityPage);
     m_linearDeflection->setObjectName(QStringLiteral("GeometryImportLinearDeflectionSpin"));
     m_linearDeflection->setRange(0.000001, 1000.0);
@@ -144,6 +187,7 @@ GeometryImportWizard::GeometryImportWizard(const QString& initialFilePath,
                                       qualityPage);
     m_ifcOptionsGroup->setObjectName(QStringLiteral("IfcImportOptionsGroup"));
     auto* ifcForm = new QFormLayout(m_ifcOptionsGroup);
+    ifcForm->setRowWrapPolicy(QFormLayout::WrapLongRows);
     m_ifcPreflightSummary = new QLabel(m_ifcOptionsGroup);
     m_ifcPreflightSummary->setObjectName(QStringLiteral("IfcImportPreflightSummary"));
     m_ifcPreflightSummary->setWordWrap(true);
@@ -204,6 +248,10 @@ GeometryImportWizard::GeometryImportWizard(const QString& initialFilePath,
     auto* progressRow = new QHBoxLayout;
     m_progressStage = new QLabel(uiText("Ready to build preview."), previewPage);
     m_progressStage->setObjectName(QStringLiteral("GeometryImportProgressStage"));
+    m_progressStage->setTextFormat(Qt::PlainText);
+    m_progressStage->setWordWrap(true);
+    m_progressStage->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    previewLayout->addWidget(m_progressStage);
     m_progress = new QProgressBar(previewPage);
     m_progress->setObjectName(QStringLiteral("GeometryImportProgressBar"));
     m_progress->setRange(0, 100);
@@ -211,14 +259,15 @@ GeometryImportWizard::GeometryImportWizard(const QString& initialFilePath,
     m_cancelImport = new QPushButton(uiText("Cancel Import"), previewPage);
     m_cancelImport->setObjectName(QStringLiteral("GeometryImportCancelButton"));
     m_cancelImport->setEnabled(false);
-    progressRow->addWidget(m_progressStage, 1);
-    progressRow->addWidget(m_progress);
+    progressRow->addWidget(m_progress, 1);
     progressRow->addWidget(m_cancelImport);
     previewLayout->addLayout(progressRow);
     m_preview = new QPlainTextEdit(previewPage);
     m_preview->setObjectName(QStringLiteral("GeometryImportPreviewReport"));
     m_preview->setReadOnly(true);
-    previewLayout->addWidget(m_preview);
+    m_preview->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+    m_preview->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    previewLayout->addWidget(m_preview, 1);
     addPage(previewPage);
 
     m_geometryWatcher = new QFutureWatcher<GeometryImportResult>(this);

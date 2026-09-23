@@ -1,6 +1,8 @@
 #pragma once
 
 #include <QHash>
+#include <QByteArray>
+#include <QSet>
 #include <QStringList>
 #include <QWidget>
 
@@ -33,6 +35,8 @@ public:
     void clearSelection();
     void setIsolationActive(bool active);
     bool isIsolationActive() const;
+    QByteArray saveViewState() const;
+    bool restoreViewState(const QByteArray& state);
 
 signals:
     void projectSelected();
@@ -65,8 +69,19 @@ private:
     void handleSelectedItem(QTreeWidgetItem* selectedItem);
     void showContextMenu(const QPoint& position);
     void applyFilter();
+    bool isFiltering() const;
     bool filterItem(QTreeWidgetItem* item);
     void scrollToItemKeepingHierarchyVisible(QTreeWidgetItem* item);
+    void updateNameColumnWidth();
+
+    struct TreeState
+    {
+        QSet<QString> expandedIds;
+        QHash<QString, int> loadedChildCounts;
+        bool projectExpanded = true;
+    };
+    TreeState captureTreeState() const;
+    void restoreTreeState(const TreeState& state);
 
     FcProject* m_project = nullptr;
     QTreeWidget* m_treeWidget = nullptr;
@@ -77,4 +92,9 @@ private:
     QHash<QString, QTreeWidgetItem*> m_itemsByObjectId;
     bool m_filterWasActive = false;
     bool m_isolationActive = false;
+    TreeState m_unfilteredTreeState;
+    int m_unfilteredVerticalPosition = 0;
+    int m_preferredNameColumnWidth = 320;
+    bool m_nameColumnUserSized = false;
+    bool m_updatingNameColumn = false;
 };

@@ -8,6 +8,7 @@ class QPushButton;
 class QTableWidget;
 class QTabWidget;
 class QLabel;
+class QToolButton;
 class SimulationTaskManager;
 
 class SimulationTaskCenterWidget final : public QWidget
@@ -19,6 +20,9 @@ public:
 
     void setManager(SimulationTaskManager* manager);
     QString selectedTaskId() const;
+    bool selectTaskById(const QString& taskId);
+    bool detailsExpanded() const;
+    void setDetailsExpanded(bool expanded);
     void retranslateUi();
 
 signals:
@@ -38,6 +42,9 @@ private:
     QLabel* m_commandLabel = nullptr;
     QLabel* m_environmentCheck = nullptr;
     QTabWidget* m_outputTabs = nullptr;
+    QWidget* m_details = nullptr;
+    QToolButton* m_detailsToggle = nullptr;
+    QLabel* m_failureSummary = nullptr;
     QPushButton* m_cancel = nullptr;
     QPushButton* m_retry = nullptr;
     QPushButton* m_openFolder = nullptr;

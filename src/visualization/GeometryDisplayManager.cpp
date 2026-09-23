@@ -1,9 +1,24 @@
 #include "visualization/GeometryDisplayManager.h"
+#include "modeling/BuildingGeometryService.h"
+#include <TopoDS_Face.hxx>
 
 #include "geometry/FcGeometryObject.h"
 #include "geometry/FcIfcObject.h"
 
 #include <AIS_TexturedShape.hxx>
+#include <AIS_ColoredShape.hxx>
+#include <BRep_Tool.hxx>
+#include <BRepBndLib.hxx>
+#include <Graphic3d_ArrayOfSegments.hxx>
+#include <Graphic3d_Group.hxx>
+#include <Poly_Triangulation.hxx>
+#include <Prs3d_Drawer.hxx>
+#include <Prs3d_LineAspect.hxx>
+#include <Prs3d_Presentation.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
+#include <TopoDS.hxx>
+#include <gp_Vec.hxx>
 #include <Quantity_Color.hxx>
 #include <Graphic3d_Vec2.hxx>
 #include <Bnd_Box.hxx>
@@ -14,9 +29,150 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QStandardPaths>
+#include <QColor>
 
 #include <algorithm>
 #include <functional>
+#include <cmath>
+#include <cstdint>
+#include <unordered_map>
+
+namespace {
+// The lines belong to the same presentation/selection owner as the solid.
+// Highlighting is an OCCT overlay and never overwrites domain appearance.
+class IfcColoredPresentation final : public AIS_ColoredShape
+{
+public:
+    explicit IfcColoredPresentation(const TopoDS_Shape& shape)
+        : AIS_ColoredShape(shape), m_edges(GeometryDisplayManager::ifcFeatureEdges(shape)) {}
+protected:
+    void Compute(const Handle(PrsMgr_PresentationManager)& manager,
+                 const Handle(Prs3d_Presentation)& presentation,
+                 const Standard_Integer mode) override
+    {
+        AIS_ColoredShape::Compute(manager, presentation, mode);
+        if (mode != 1 || m_edges.isEmpty()) return;
+        Handle(Graphic3d_ArrayOfSegments) segments = new Graphic3d_ArrayOfSegments(
+            static_cast<Standard_Integer>(m_edges.size() * 2));
+        for (const auto& edge : m_edges) {
+            segments->AddVertex(edge[0]);
+            segments->AddVertex(edge[1]);
+        }
+        const Handle(Graphic3d_Group) group = presentation->NewGroup();
+        group->SetPrimitivesAspect(Attributes()->FaceBoundaryAspect()->Aspect());
+        group->AddPrimitiveArray(segments);
+    }
+private:
+    QVector<std::array<gp_Pnt, 2>> m_edges;
+};
+}
+
+QVector<std::array<gp_Pnt, 2>> GeometryDisplayManager::ifcFeatureEdges(
+    const TopoDS_Shape& shape, double creaseAngleDegrees)
+{
+    QVector<std::array<gp_Pnt, 2>> result;
+    if (shape.IsNull()) return result;
+    struct PointHash {
+        std::size_t operator()(const std::array<std::int64_t, 3>& p) const {
+            std::size_t seed = 0;
+            for (auto value : p) seed ^= std::hash<std::int64_t>{}(value) +
+                0x9e3779b9 + (seed << 6) + (seed >> 2);
+            return seed;
+        }
+    };
+    struct Edge { int first; int second; gp_Vec normal; int count = 1; bool crease = false; };
+    std::unordered_map<std::array<std::int64_t, 3>, int, PointHash> vertices;
+    std::unordered_map<std::uint64_t, Edge> edges;
+    QVector<gp_Pnt> points;
+    const double cosine = std::cos(std::clamp(creaseAngleDegrees, 0.1, 89.9) * std::acos(-1.0) / 180.0);
+    // glTF often duplicates vertices at normals/material seams. Weld for display
+    // adjacency only; the actual imported geometry remains byte-for-byte intact.
+    Bnd_Box bounds;
+    BRepBndLib::Add(shape, bounds);
+    double tolerance = 1.0e-7;
+    gp_Pnt origin;
+    if (!bounds.IsVoid()) {
+        origin = bounds.CornerMin();
+        tolerance = std::max(tolerance, origin.Distance(bounds.CornerMax()) * 1.0e-9);
+    }
+    const auto vertexIndex = [&](const gp_Pnt& point) {
+        const std::array<std::int64_t, 3> key{
+            std::llround((point.X() - origin.X()) / tolerance),
+            std::llround((point.Y() - origin.Y()) / tolerance),
+            std::llround((point.Z() - origin.Z()) / tolerance)};
+        const auto found = vertices.find(key);
+        if (found != vertices.end()) return found->second;
+        const int index = static_cast<int>(points.size());
+        vertices.emplace(key, index);
+        points.append(point);
+        return index;
+    };
+    TopTools_IndexedMapOfShape faces;
+    TopExp::MapShapes(shape, TopAbs_FACE, faces);
+    for (int f = 1; f <= faces.Extent(); ++f) {
+        const TopoDS_Face face = TopoDS::Face(faces(f));
+        if (!BRep_Tool::Surface(face).IsNull()) continue; // true BREP uses OCCT feature boundaries
+        TopLoc_Location location;
+        const Handle(Poly_Triangulation) mesh = BRep_Tool::Triangulation(face, location);
+        if (mesh.IsNull()) continue;
+        QVector<int> indices(mesh->NbNodes() + 1);
+        for (int i = 1; i <= mesh->NbNodes(); ++i)
+            indices[i] = vertexIndex(mesh->Node(i).Transformed(location.Transformation()));
+        for (int i = 1; i <= mesh->NbTriangles(); ++i) {
+            int a, b, c;
+            mesh->Triangle(i).Get(a, b, c);
+            const int ids[] = {indices[a], indices[b], indices[c]};
+            gp_Vec normal = gp_Vec(points[ids[0]], points[ids[1]]).Crossed(
+                gp_Vec(points[ids[0]], points[ids[2]]));
+            if (normal.SquareMagnitude() < 1.0e-24) continue;
+            normal.Normalize();
+            for (int side = 0; side < 3; ++side) {
+                const int low = std::min(ids[side], ids[(side + 1) % 3]);
+                const int high = std::max(ids[side], ids[(side + 1) % 3]);
+                const auto key = (static_cast<std::uint64_t>(low) << 32) | static_cast<std::uint32_t>(high);
+                auto found = edges.find(key);
+                if (found == edges.end()) edges.emplace(key, Edge{low, high, normal});
+                else {
+                    ++found->second.count;
+                    found->second.crease |= std::abs(found->second.normal.Dot(normal)) < cosine;
+                }
+            }
+        }
+    }
+    for (const auto& item : edges) {
+        const Edge& edge = item.second;
+        if (edge.count != 2 || edge.crease)
+            result.append({points[edge.first], points[edge.second]});
+    }
+    return result;
+}
+
+Handle(AIS_Shape) GeometryDisplayManager::createIfcPresentation(const FcIfcObject& object)
+{
+    if (!object.hasShape()) return {};
+    Handle(AIS_ColoredShape) presentation = new IfcColoredPresentation(object.shape());
+    const FcIfcAppearance& base = object.appearance();
+    presentation->SetColor(Quantity_Color(base.red, base.green, base.blue, Quantity_TOC_RGB));
+    presentation->SetTransparency(1.0 - base.alpha);
+    TopTools_IndexedMapOfShape faces;
+    TopExp::MapShapes(object.shape(), TopAbs_FACE, faces);
+    bool hasAnalyticFaces = false;
+    for (int i = 1; i <= faces.Extent(); ++i)
+        hasAnalyticFaces |= !BRep_Tool::Surface(TopoDS::Face(faces(i))).IsNull();
+    for (auto it = object.faceAppearances().cbegin(); it != object.faceAppearances().cend(); ++it) {
+        const FcIfcAppearance& appearance = it.value();
+        presentation->SetCustomColor(faces(it.key()), Quantity_Color(
+            appearance.red, appearance.green, appearance.blue, Quantity_TOC_RGB));
+        presentation->SetCustomTransparency(faces(it.key()), 1.0 - appearance.alpha);
+    }
+    presentation->Attributes()->SetFaceBoundaryDraw(hasAnalyticFaces);
+    presentation->Attributes()->SetFaceBoundaryUpperContinuity(GeomAbs_C0);
+    presentation->Attributes()->SetFaceBoundaryAspect(new Prs3d_LineAspect(
+        Quantity_Color(0.12, 0.14, 0.17, Quantity_TOC_RGB), Aspect_TOL_SOLID, 1.1));
+    presentation->Attributes()->SetIsoOnTriangulation(false);
+    presentation->SetDisplayMode(1);
+    return presentation;
+}
 
 GeometryDisplayManager::GeometryDisplayManager(
     const Handle(AIS_InteractiveContext)& context)
@@ -91,10 +247,15 @@ bool GeometryDisplayManager::displayObject(
         }
     }
     const QVariantMap& parameters = object->geometryParameters();
+    GeometryDisplayStyle style;
+    // An opening is a cutter, not a solid filling the hole in its host.
+    if (BuildingGeometryService::isOpeningKind(object->geometryKind())) {
+        style.wireframe = true;
+        style.red = 0.9; style.green = 0.35; style.blue = 0.1;
+    }
     if (parameters.contains(QStringLiteral("displayColorRed")) &&
         parameters.contains(QStringLiteral("displayColorGreen")) &&
         parameters.contains(QStringLiteral("displayColorBlue"))) {
-        GeometryDisplayStyle style;
         style.red = std::clamp(parameters.value(QStringLiteral("displayColorRed")).toDouble(),
                                0.0, 1.0);
         style.green = std::clamp(parameters.value(QStringLiteral("displayColorGreen")).toDouble(),
@@ -103,12 +264,17 @@ bool GeometryDisplayManager::displayObject(
                                 0.0, 1.0);
         style.transparency = 1.0 - std::clamp(
             parameters.value(QStringLiteral("displayOpacity"), 1.0).toDouble(), 0.0, 1.0);
-        const bool displayed = displayShapeWithoutUpdate(object->id(), object->shape(),
-                                                         style, true);
-        if (displayed && !m_context.IsNull()) m_context->UpdateCurrentViewer();
-        return displayed;
     }
-    return displayShape(object->id(), object->shape());
+    const QColor overrideColor(parameters.value(QStringLiteral("displayColor")).toString());
+    if (overrideColor.isValid()) {
+        const Quantity_Color color(overrideColor.redF(), overrideColor.greenF(),
+                                   overrideColor.blueF(), Quantity_TOC_sRGB);
+        style.red = color.Red(); style.green = color.Green(); style.blue = color.Blue();
+    }
+    style.outline = parameters.value(QStringLiteral("displayOutline"), false).toBool();
+    const bool displayed = displayShapeWithoutUpdate(object->id(), object->shape(), style, true);
+    if (displayed && !m_context.IsNull()) m_context->UpdateCurrentViewer();
+    return displayed;
 }
 
 bool GeometryDisplayManager::displayShape(const QString& objectId,
@@ -144,11 +310,15 @@ bool GeometryDisplayManager::displayIfcModel(
                 return;
             }
             if (object->hasShape()) {
-                if (!displayShapeWithoutUpdate(
-                        object->id(), object->shape(), GeometryDisplayStyle{}, true)) {
+                const Handle(AIS_Shape) presentation = createIfcPresentation(*object);
+                if (presentation.IsNull()) {
                     failed = true;
                     return;
                 }
+                removeObjectWithoutUpdate(object->id());
+                m_context->Display(presentation, Standard_False);
+                m_presentations[object->id()].append(presentation);
+                m_objectIdsByPresentation.insert(presentation.get(), object->id());
                 displayedIds.append(object->id());
             }
             for (const FcObject::Ptr& child : object->children()) {
@@ -375,6 +545,10 @@ bool GeometryDisplayManager::displayShapeWithoutUpdate(
 
     if (replaceExisting) removeObjectWithoutUpdate(objectId);
     Handle(AIS_Shape) presentation = new AIS_Shape(shape);
+    presentation->Attributes()->SetFaceBoundaryDraw(style.outline);
+    presentation->Attributes()->SetFaceBoundaryUpperContinuity(GeomAbs_C0);
+    presentation->Attributes()->SetFaceBoundaryAspect(new Prs3d_LineAspect(
+        Quantity_Color(0.12, 0.14, 0.17, Quantity_TOC_RGB), Aspect_TOL_SOLID, 1.1));
     m_context->SetColor(
         presentation,
         Quantity_Color(style.red, style.green, style.blue, Quantity_TOC_RGB),

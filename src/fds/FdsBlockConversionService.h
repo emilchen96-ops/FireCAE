@@ -49,6 +49,10 @@ public:
         const QVector<std::shared_ptr<FcGeometryObject>>& geometry,
         const QVector<std::shared_ptr<FcFdsMesh>>& meshes,
         bool useGeomForArbitrary = false);
+    // Returns untranslated complete error sentences, without the object name.
+    // Validate using the same route policy as the eventual conversion.
+    static QStringList validateSurfaceAssignments(
+        const FcGeometryObject& geometry, bool useGeomForArbitrary = true);
     static FcFdsBounds boundsForShape(const FcGeometryObject& geometry,
                                       bool* valid = nullptr);
     static FcFdsBounds snapBounds(const FcFdsBounds& requested,

@@ -4,8 +4,15 @@
 #include "modeling/BuildingGeometryService.h"
 
 #include <BRepBndLib.hxx>
+#include <BRep_Tool.hxx>
 #include <Bnd_Box.hxx>
+#include <Poly_Triangulation.hxx>
 #include <Standard_Failure.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopoDS.hxx>
+#include <TopoDS_Face.hxx>
+
+#include <QSet>
 
 #include <algorithm>
 #include <cmath>
@@ -115,6 +122,59 @@ void collapseSmallestAxisToPlane(FcFdsBounds& bounds)
 }
 }
 
+QStringList FdsBlockConversionService::validateSurfaceAssignments(
+    const FcGeometryObject& geometry, bool useGeomForArbitrary)
+{
+    const QString route = geometry.geometryParameters()
+        .value(QStringLiteral("fdsConversionRoute"), QStringLiteral("Auto"))
+        .toString().trimmed().toUpper();
+    if (route == QStringLiteral("IGNORE") || route == QStringLiteral("REFERENCE")) return {};
+    const auto& assignments = geometry.faceSurfaceIds();
+    const bool hasDefault = !geometry.defaultSurfaceId().isEmpty();
+    const FdsBlockTarget target = targetFor(geometry, useGeomForArbitrary);
+    if (target == FdsBlockTarget::Hole) {
+        return hasDefault || !assignments.isEmpty()
+            ? QStringList{QStringLiteral("HOLE geometry cannot have surface assignments.")}
+            : QStringList{};
+    }
+    if (target == FdsBlockTarget::Vent) {
+        return !assignments.isEmpty()
+            ? QStringList{QStringLiteral("VENT geometry accepts only a default surface, not per-face assignments.")}
+            : QStringList{};
+    }
+    if (assignments.isEmpty()) return {};
+
+    const QSet<QString> axisFaces{QStringLiteral("X-"), QStringLiteral("X+"),
+        QStringLiteral("Y-"), QStringLiteral("Y+"), QStringLiteral("Z-"), QStringLiteral("Z+")};
+    QSet<QString> shapeFaces;
+    if (target == FdsBlockTarget::Geom) {
+        for (const auto& face : BuildingGeometryService::faceInfos(geometry.shape()))
+            shapeFaces.insert(face.key);
+    }
+    QStringList errors;
+    for (auto assignment = assignments.cbegin(); assignment != assignments.cend(); ++assignment) {
+        if (assignment.value().isEmpty())
+            errors.append(QStringLiteral("Face surface assignments must reference a surface."));
+        if (target == FdsBlockTarget::Geom) {
+            if (!assignment.key().startsWith(QStringLiteral("TopoFace:")))
+                errors.append(QStringLiteral("GEOM geometry accepts only topological face surface assignments."));
+            else if (!shapeFaces.contains(assignment.key()))
+                errors.append(QStringLiteral("An assigned topological face does not belong to this geometry."));
+        } else if (!axisFaces.contains(assignment.key())) {
+            errors.append(QStringLiteral("OBST geometry accepts only X-, X+, Y-, Y+, Z-, and Z+ face surface assignments."));
+        }
+    }
+    errors.removeDuplicates();
+    if (!errors.isEmpty()) return errors;
+    // Without a default, every exported face needs an explicit reference.
+    // Otherwise OBST drops overrides, while GEOM previously spread surface 1
+    // over the remaining faces. Neither is a safe physical interpretation.
+    const auto& requiredFaces = target == FdsBlockTarget::Geom ? shapeFaces : axisFaces;
+    if (!hasDefault && assignments.size() != requiredFaces.size())
+        errors.append(QStringLiteral("Partial face surface assignments require an explicit default surface or assignments for every face."));
+    return errors;
+}
+
 FdsBlockConversionResult FdsBlockConversionService::convert(
     const QVector<std::shared_ptr<FcGeometryObject>>& geometry,
     const QVector<std::shared_ptr<FcFdsMesh>>& meshes,
@@ -126,7 +186,7 @@ FdsBlockConversionResult FdsBlockConversionService::convert(
     int ventNumber = 1;
     int geomNumber = 1;
     for (const auto& source : geometry) {
-        if (!source || !source->hasShape() || !source->isVisible() ||
+        if (!source || !source->hasShape() ||
             source->geometryKind() == FcGeometryKind::BackgroundImage) continue;
         const QString conversionRoute = source->geometryParameters()
                                             .value(QStringLiteral("fdsConversionRoute"),
@@ -139,8 +199,45 @@ FdsBlockConversionResult FdsBlockConversionService::convert(
                     .arg(source->name(), conversionRoute));
             continue;
         }
+        const QStringList surfaceErrors = validateSurfaceAssignments(*source, useGeomForArbitrary);
+        if (!surfaceErrors.isEmpty()) {
+            for (const QString& error : surfaceErrors)
+                result.errors.append(QStringLiteral("%1: %2").arg(source->name(), error));
+            continue;
+        }
         QVector<FcFdsBounds> requestedPieces;
         const FdsBlockTarget sourceTarget = targetFor(*source, useGeomForArbitrary);
+        const QVariantMap additional = source->geometryParameters()
+            .value(QStringLiteral("fdsAdditionalFields")).toMap();
+        bool validAdditional = true;
+        for (auto field = additional.cbegin(); field != additional.cend(); ++field) {
+            const QString key = field.key().trimmed().toUpper();
+            const QString value = field.value().toString().trimmed().toUpper();
+            const bool logical = key == QStringLiteral("BNDF_OBST") ||
+                key == QStringLiteral("THICKEN") || key == QStringLiteral("PERMIT_HOLE") ||
+                key == QStringLiteral("ALLOW_VENT") || key == QStringLiteral("REMOVABLE");
+            bool numberValid = false;
+            const double density = value.toDouble(&numberValid);
+            const bool validValue = logical
+                ? (value == QStringLiteral(".TRUE.") || value == QStringLiteral(".FALSE."))
+                : (key == QStringLiteral("BULK_DENSITY") && numberValid &&
+                   std::isfinite(density) && density > 0.0);
+            if (key != field.key() || !validValue ||
+                (sourceTarget != FdsBlockTarget::Obstruction &&
+                 sourceTarget != FdsBlockTarget::RasterizedObstruction)) {
+                result.errors.append(QStringLiteral("%1: invalid or unsupported OBST additional field %2.")
+                    .arg(source->name(), field.key()));
+                validAdditional = false;
+            }
+        }
+        if (!validAdditional) continue;
+        const QString activationKind=source->geometryParameters().value(
+            QStringLiteral("activationReferenceKind"), QStringLiteral("CTRL_ID")).toString();
+        if(!source->controlObjectId().isEmpty() && activationKind!=QStringLiteral("CTRL_ID") &&
+            activationKind!=QStringLiteral("DEVC_ID")) {
+            result.errors.append(QStringLiteral("%1: invalid activation reference kind.").arg(source->name()));
+            continue;
+        }
         const BuildingGeometryRequest sourceRequest =
             BuildingGeometryService::requestFromParameters(
                 source->geometryKind(), source->geometryParameters());
@@ -238,6 +335,11 @@ FdsBlockConversionResult FdsBlockConversionService::convert(
                 preview.sourceName + QStringLiteral(" [FDS]"),
                 FcObjectType::Obstruction, QStringLiteral("OBST"), id);
             namelist->addRawParameter(QStringLiteral("XB"), rawBounds(preview.actual));
+            for (auto field = additional.cbegin(); field != additional.cend(); ++field)
+                namelist->addRawParameter(field.key(), field.value().toString().trimmed().toUpper());
+            if (!source->controlObjectId().isEmpty())
+                namelist->addReferenceParameter(source->geometryParameters().value(
+                    QStringLiteral("activationReferenceKind"), QStringLiteral("CTRL_ID")).toString(), {source->controlObjectId()});
             QStringList directionalSurfaces;
             bool completeDirectionalAssignment = true;
             for (const QString& face : {QStringLiteral("X-"), QStringLiteral("X+"),
@@ -344,7 +446,8 @@ FdsBlockConversionResult FdsBlockConversionService::convert(
             namelist->addRawParameter(QStringLiteral("XB"), rawBounds(preview.actual));
             if (hole && source->isDynamicOpening() &&
                 !source->controlObjectId().isEmpty()) {
-                namelist->addReferenceParameter(QStringLiteral("CTRL_ID"),
+                namelist->addReferenceParameter(source->geometryParameters().value(
+                    QStringLiteral("activationReferenceKind"), QStringLiteral("CTRL_ID")).toString(),
                                                 {source->controlObjectId()});
             }
             converted = namelist;
@@ -370,7 +473,7 @@ FdsBlockConversionResult FdsBlockConversionService::convert(
         }
     }
     if (result.previews.isEmpty() && result.errors.isEmpty()) {
-        result.warnings.append(QStringLiteral("No visible building geometry is available for conversion."));
+        result.warnings.append(QStringLiteral("No building geometry is available for conversion."));
     }
     return result;
 }
@@ -383,7 +486,22 @@ FcFdsBounds FdsBlockConversionService::boundsForShape(
     if (!geometry.hasShape()) return bounds;
     try {
         Bnd_Box box;
-        BRepBndLib::Add(geometry.shape(), box);
+        // Solver bounds describe the actual solid, not its display mesh's
+        // deflection or BREP tolerance envelope. Both Add() and AddOptimal()
+        // with useTriangulation=true pad triangulations in OCCT 7.8, which can
+        // turn an exactly grid-aligned wall into an extra layer of FDS cells.
+        BRepBndLib::AddOptimal(geometry.shape(), box, Standard_False, Standard_False);
+        // GLB/IFC reference meshes have no analytic surfaces. AddOptimal(false)
+        // skips those faces, so include their actual located vertices directly.
+        for (TopExp_Explorer faces(geometry.shape(), TopAbs_FACE); faces.More(); faces.Next()) {
+            const TopoDS_Face face = TopoDS::Face(faces.Current());
+            if (!BRep_Tool::Surface(face).IsNull()) continue;
+            TopLoc_Location location;
+            const Handle(Poly_Triangulation) triangles = BRep_Tool::Triangulation(face, location);
+            if (triangles.IsNull()) continue;
+            for (int index = 1; index <= triangles->NbNodes(); ++index)
+                box.Add(triangles->Node(index).Transformed(location.Transformation()));
+        }
         if (box.IsVoid()) return bounds;
         box.Get(bounds.xMin, bounds.yMin, bounds.zMin,
                 bounds.xMax, bounds.yMax, bounds.zMax);

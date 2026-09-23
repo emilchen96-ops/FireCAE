@@ -14,6 +14,9 @@
 #include "import/IfcImportService.h"
 #include "modeling/SnapManager.h"
 #include "modeling/BuildingGeometryService.h"
+#include <BRep_Builder.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
+#include <TopoDS_Compound.hxx>
 #include "reliability/ProjectRecoveryManager.h"
 #include "settings/ApplicationSettings.h"
 #include "results/FcResultCase.h"
@@ -617,9 +620,17 @@ int main(int argc, char* argv[])
         BuildingGeometryService::validate(wallShape);
     check(wallValidation.valid && wallValidation.closed,
           "A09 geometry validation recognizes a closed wall solid");
-    check(wallValidation.faceCount == 6 && wallValidation.vertexCount > 0 &&
-              !wallValidation.hasDuplicateFaces,
+    check(wallValidation.faceCount == 6 && wallValidation.vertexCount == 8 &&
+              !wallValidation.hasDuplicateFaces && !wallValidation.hasDuplicateVertices,
           "R01 geometry quality reports face/vertex counts and duplicate faces");
+    BRep_Builder duplicateBuilder;
+    TopoDS_Compound duplicateVertices;
+    duplicateBuilder.MakeCompound(duplicateVertices);
+    duplicateBuilder.Add(duplicateVertices, BRepBuilderAPI_MakeVertex(gp_Pnt()).Shape());
+    duplicateBuilder.Add(duplicateVertices, BRepBuilderAPI_MakeVertex(gp_Pnt()).Shape());
+    const auto coincidentValidation = BuildingGeometryService::validate(duplicateVertices);
+    check(coincidentValidation.vertexCount == 2 && coincidentValidation.duplicateVertexCount == 1,
+          "Distinct coincident vertices are still diagnosed, unlike shared incident vertex occurrences");
     const QVector<GeometryFaceInfo> wallFaces =
         BuildingGeometryService::faceInfos(wallShape);
     QSet<QString> wallFaceKeys;

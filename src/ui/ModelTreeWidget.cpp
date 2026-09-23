@@ -19,6 +19,7 @@
 #include <QLineEdit>
 #include <QMenu>
 #include <QScrollBar>
+#include <QScopedValueRollback>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
@@ -26,6 +27,9 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QItemSelectionModel>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <functional>
@@ -64,6 +68,21 @@ public:
     using DropHandler = std::function<void(QTreeWidgetItem*, QTreeWidgetItem*, int)>;
     explicit ReorderableTreeWidget(QWidget* parent = nullptr) : QTreeWidget(parent) {}
     DropHandler dropHandler;
+    bool restoringViewport = false;
+    int visibleContentWidth() const { return sizeHintForColumn(0); }
+
+    void scrollTo(const QModelIndex& index,
+                  ScrollHint hint = EnsureVisible) override
+    {
+        // Restoring the current index during a rebuild must not expand a
+        // deliberately collapsed ancestor or recenter the user's viewport.
+        if (restoringViewport) return;
+        const int horizontalPosition = horizontalScrollBar()->value();
+        QTreeWidget::scrollTo(index, hint);
+        // Selection and keyboard navigation may invoke scrollTo internally.
+        // Leave horizontal navigation under the user's control in all cases.
+        horizontalScrollBar()->setValue(horizontalPosition);
+    }
 
 protected:
     void dropEvent(QDropEvent* event) override
@@ -137,13 +156,15 @@ ModelTreeWidget::ModelTreeWidget(QWidget* parent)
     m_treeWidget->setHeaderLabel(
         UiLanguageManager::text(QStringLiteral("Name")));
     m_treeWidget->setHeaderHidden(false);
+    m_treeWidget->header()->setStretchLastSection(false);
     m_treeWidget->header()->setSectionResizeMode(0, QHeaderView::Interactive);
     m_treeWidget->header()->resizeSection(0, 320);
     m_treeWidget->header()->setMinimumSectionSize(120);
     m_treeWidget->setUniformRowHeights(true);
-    m_treeWidget->setIndentation(16);
+    m_treeWidget->setIndentation(12);
     m_treeWidget->setTextElideMode(Qt::ElideMiddle);
-    m_treeWidget->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_treeWidget->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    m_treeWidget->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
     m_treeWidget->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
     m_treeWidget->setContextMenuPolicy(Qt::CustomContextMenu);
     m_treeWidget->setSelectionMode(QAbstractItemView::ExtendedSelection);
@@ -153,7 +174,17 @@ ModelTreeWidget::ModelTreeWidget(QWidget* parent)
     m_treeWidget->setDragDropMode(QAbstractItemView::InternalMove);
     m_treeWidget->setDefaultDropAction(Qt::MoveAction);
     m_treeWidget->installEventFilter(this);
+    m_treeWidget->viewport()->installEventFilter(this);
     layout->addWidget(m_treeWidget);
+
+    connect(m_treeWidget->header(), &QHeaderView::sectionResized, this,
+            [this](int section, int, int width) {
+                if (section != 0 || m_updatingNameColumn) return;
+                m_nameColumnUserSized = true;
+                m_preferredNameColumnWidth = width;
+            });
+    connect(m_treeWidget->verticalScrollBar(), &QScrollBar::valueChanged,
+            this, [this]() { updateNameColumnWidth(); });
 
     connect(m_treeWidget,
             &QTreeWidget::itemSelectionChanged,
@@ -168,7 +199,12 @@ ModelTreeWidget::ModelTreeWidget(QWidget* parent)
             this,
             &ModelTreeWidget::handleItemDoubleClicked);
     connect(m_treeWidget, &QTreeWidget::itemExpanded, this,
-            [this](QTreeWidgetItem* item) { loadNextChildBatch(item); });
+            [this](QTreeWidgetItem* item) {
+                if (item->data(0, LoadedChildCountRole).toInt() == 0) {
+                    loadNextChildBatch(item);
+                }
+                updateNameColumnWidth();
+            });
     connect(m_searchEdit, &QLineEdit::textChanged, this, [this]() { applyFilter(); });
     connect(m_typeFilter, &QComboBox::currentIndexChanged, this, [this]() { applyFilter(); });
     connect(m_floorFilter, &QComboBox::currentIndexChanged,
@@ -177,9 +213,6 @@ ModelTreeWidget::ModelTreeWidget(QWidget* parent)
         m_treeWidget->collapseAll();
         if (m_treeWidget->topLevelItemCount() > 0) {
             m_treeWidget->topLevelItem(0)->setExpanded(true);
-        }
-        if (QScrollBar* scrollBar = m_treeWidget->horizontalScrollBar()) {
-            scrollBar->setValue(0);
         }
     });
     connect(locateSelectionButton, &QToolButton::clicked, this, [this]() {
@@ -270,6 +303,7 @@ bool ModelTreeWidget::selectObjectsByIds(const QStringList& objectIds, bool noti
         item->setSelected(true);
     }
     m_treeWidget->setCurrentItem(items.constFirst(), 0, QItemSelectionModel::NoUpdate);
+    updateNameColumnWidth();
     scrollToItemKeepingHierarchyVisible(items.constFirst());
     if (notify) {
         const QStringList ids = selectedObjectIds();
@@ -298,8 +332,56 @@ bool ModelTreeWidget::isIsolationActive() const
 
 void ModelTreeWidget::setProject(FcProject* project)
 {
+    if (project != m_project) {
+        m_filterWasActive = false;
+        m_unfilteredTreeState = {};
+    }
     m_project = project;
     refresh();
+}
+
+QByteArray ModelTreeWidget::saveViewState() const
+{
+    return QJsonDocument(QJsonObject{
+        {QStringLiteral("version"), 1},
+        {QStringLiteral("nameWidth"), m_preferredNameColumnWidth},
+        {QStringLiteral("userSized"), m_nameColumnUserSized},
+        {QStringLiteral("horizontalPosition"), m_treeWidget->horizontalScrollBar()->value()}
+    }).toJson(QJsonDocument::Compact);
+}
+
+bool ModelTreeWidget::restoreViewState(const QByteArray& state)
+{
+    const QJsonObject object = QJsonDocument::fromJson(state).object();
+    const int width = object.value(QStringLiteral("nameWidth")).toInt();
+    const int position = object.value(QStringLiteral("horizontalPosition")).toInt(-1);
+    if (object.value(QStringLiteral("version")).toInt() != 1 ||
+        width < 120 || width > m_treeWidget->header()->maximumSectionSize() ||
+        position < 0 || !object.value(QStringLiteral("userSized")).isBool()) {
+        return false;
+    }
+    m_preferredNameColumnWidth = width;
+    m_nameColumnUserSized = object.value(QStringLiteral("userSized")).toBool();
+    updateNameColumnWidth();
+    m_treeWidget->doItemsLayout();
+    m_treeWidget->horizontalScrollBar()->setValue(position);
+    return true;
+}
+
+void ModelTreeWidget::updateNameColumnWidth()
+{
+    if (!m_treeWidget || m_updatingNameColumn) return;
+    m_updatingNameColumn = true;
+    if (!m_nameColumnUserSized) {
+        // Grow for newly exposed names, but do not shrink during filtering or
+        // refresh: doing so would discard an intentional horizontal position.
+        m_preferredNameColumnWidth = qMax(
+            m_preferredNameColumnWidth,
+            static_cast<ReorderableTreeWidget*>(m_treeWidget)->visibleContentWidth());
+    }
+    m_treeWidget->header()->resizeSection(
+        0, qMax(m_preferredNameColumnWidth, m_treeWidget->viewport()->width()));
+    m_updatingNameColumn = false;
 }
 
 void ModelTreeWidget::retranslateUi()
@@ -338,29 +420,69 @@ void ModelTreeWidget::retranslateUi()
     }
 }
 
+ModelTreeWidget::TreeState ModelTreeWidget::captureTreeState() const
+{
+    TreeState state;
+    if (m_treeWidget->topLevelItemCount() > 0) {
+        state.projectExpanded = m_treeWidget->topLevelItem(0)->isExpanded();
+    }
+    for (auto it = m_itemsByObjectId.cbegin(); it != m_itemsByObjectId.cend(); ++it) {
+        if (it.value()->isExpanded()) state.expandedIds.insert(it.key());
+        const int loaded = it.value()->data(0, LoadedChildCountRole).toInt();
+        if (loaded > 0) state.loadedChildCounts.insert(it.key(), loaded);
+    }
+    return state;
+}
+
+void ModelTreeWidget::restoreTreeState(const TreeState& state)
+{
+    if (!m_project || !m_project->document()) return;
+    for (auto it = state.loadedChildCounts.cbegin();
+         it != state.loadedChildCounts.cend(); ++it) {
+        QTreeWidgetItem* item = m_itemsByObjectId.value(it.key(), nullptr);
+        if (!item) {
+            const FcObject::Ptr object = m_project->document()->findObject(it.key());
+            item = ensureItemForObject(object.get());
+        }
+        if (item && item->data(0, LoadedChildCountRole).toInt() < it.value()) {
+            loadNextChildBatch(item, it.value() - 1);
+        }
+    }
+    for (const QString& id : state.expandedIds) {
+        QTreeWidgetItem* item = m_itemsByObjectId.value(id, nullptr);
+        if (!item) {
+            const FcObject::Ptr object = m_project->document()->findObject(id);
+            item = ensureItemForObject(object.get());
+        }
+        if (item) item->setExpanded(true);
+    }
+    if (m_treeWidget->topLevelItemCount() > 0) {
+        m_treeWidget->topLevelItem(0)->setExpanded(state.projectExpanded);
+    }
+}
+
 void ModelTreeWidget::refresh()
 {
-    const QString previousSelection = selectedObjectId();
+    const QString previousCurrent = selectedObjectId();
+    QStringList previousSelections;
+    // selectedItems() omits hidden rows; retain their UUID selection as well.
+    for (auto it = m_itemsByObjectId.cbegin(); it != m_itemsByObjectId.cend(); ++it) {
+        if (it.value()->isSelected()) previousSelections.append(it.key());
+    }
     const QString previousFloor = m_floorFilter
                                       ? m_floorFilter->currentData().toString()
                                       : QString{};
-    QSet<QString> expandedObjectIds;
-    std::function<void(QTreeWidgetItem*)> rememberExpandedItems =
-        [&](QTreeWidgetItem* item) {
-            if (!item) return;
-            if (item->isExpanded()) {
-                const QString id = item->data(0, ObjectIdRole).toString();
-                if (!id.isEmpty()) expandedObjectIds.insert(id);
-            }
-            for (int index = 0; index < item->childCount(); ++index) {
-                rememberExpandedItems(item->child(index));
-            }
-        };
-    for (int index = 0; index < m_treeWidget->topLevelItemCount(); ++index) {
-        rememberExpandedItems(m_treeWidget->topLevelItem(index));
-    }
+    const bool clearingFilter = m_filterWasActive && !isFiltering();
+    const TreeState previousState = clearingFilter ? m_unfilteredTreeState
+                                                  : captureTreeState();
+    const int horizontalPosition = m_treeWidget->horizontalScrollBar()->value();
+    const int verticalPosition = clearingFilter ? m_unfilteredVerticalPosition
+                                                : m_treeWidget->verticalScrollBar()->value();
+    if (clearingFilter) m_filterWasActive = false;
 
     const QSignalBlocker blocker(m_treeWidget);
+    QScopedValueRollback<bool> restoringViewport(
+        static_cast<ReorderableTreeWidget*>(m_treeWidget)->restoringViewport, true);
     m_itemsByObjectId.clear();
     m_treeWidget->clear();
 
@@ -416,24 +538,21 @@ void ModelTreeWidget::refresh()
         appendObjectItem(projectItem, group);
     }
 
-    projectItem->setExpanded(true);
-    for (const QString& objectId : expandedObjectIds) {
-        if (QTreeWidgetItem* item = m_itemsByObjectId.value(objectId, nullptr)) {
-            item->setExpanded(true);
-        }
-    }
+    restoreTreeState(previousState);
     applyFilter();
 
-    QTreeWidgetItem* previousItem = m_itemsByObjectId.value(previousSelection, nullptr);
-    if (previousItem) {
-        for (QTreeWidgetItem* parent = previousItem->parent(); parent;
-             parent = parent->parent()) {
-            parent->setExpanded(true);
+    for (const QString& id : previousSelections) {
+        const FcObject::Ptr object = m_project->document()->findObject(id);
+        if (QTreeWidgetItem* item = ensureItemForObject(object.get())) {
+            item->setSelected(true);
         }
-        m_treeWidget->setCurrentItem(previousItem);
-        previousItem->setSelected(true);
-        scrollToItemKeepingHierarchyVisible(previousItem);
     }
+    m_treeWidget->setCurrentItem(m_itemsByObjectId.value(previousCurrent, nullptr),
+                                 0, QItemSelectionModel::NoUpdate);
+    updateNameColumnWidth();
+    m_treeWidget->doItemsLayout();
+    m_treeWidget->horizontalScrollBar()->setValue(horizontalPosition);
+    m_treeWidget->verticalScrollBar()->setValue(verticalPosition);
 }
 
 void ModelTreeWidget::appendObjectItem(QTreeWidgetItem* parentItem,
@@ -604,6 +723,9 @@ void ModelTreeWidget::handleSelectionChanged()
 
 bool ModelTreeWidget::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched == m_treeWidget->viewport() && event->type() == QEvent::Resize) {
+        QTimer::singleShot(0, this, [this]() { updateNameColumnWidth(); });
+    }
     if (watched == m_treeWidget && event->type() == QEvent::KeyPress &&
         static_cast<QKeyEvent*>(event)->key() == Qt::Key_Escape) {
         clearSelection();
@@ -621,12 +743,12 @@ void ModelTreeWidget::handleItemDoubleClicked(QTreeWidgetItem* item, int column)
         QTreeWidgetItem* parentItem = item->parent();
         loadNextChildBatch(parentItem);
         if (parentItem) parentItem->setExpanded(true);
+        updateNameColumnWidth();
         return;
     }
     const QString objectId = item->data(0, ObjectIdRole).toString();
     const FcObject::Ptr object = m_project->document()->findObject(objectId);
-    if (object && !isLockedForModification(object.get()) &&
-        std::dynamic_pointer_cast<FcFdsNamelist>(object)) {
+    if (object) {
         emit editObjectRequested(objectId);
     }
 }
@@ -704,6 +826,12 @@ void ModelTreeWidget::showContextMenu(const QPoint& position)
         emit lockChangeRequested(objectId, !object->isLocked());
     });
     menu.addSeparator();
+    QAction* propertiesAction = menu.addAction(
+        UiLanguageManager::text(QStringLiteral("Properties...")));
+    propertiesAction->setObjectName(QStringLiteral("ObjectPropertiesAction"));
+    connect(propertiesAction, &QAction::triggered, this, [this, objectId]() {
+        emit editObjectRequested(objectId);
+    });
     if (std::dynamic_pointer_cast<FcFdsNamelist>(object)) {
         QAction* editAction = menu.addAction(
             UiLanguageManager::text(QStringLiteral("Edit FDS Object...")));
@@ -750,21 +878,31 @@ void ModelTreeWidget::showContextMenu(const QPoint& position)
     menu.exec(m_treeWidget->viewport()->mapToGlobal(position));
 }
 
-void ModelTreeWidget::applyFilter()
+bool ModelTreeWidget::isFiltering() const
 {
-    if (!m_treeWidget) return;
-    const bool filtering =
+    return
         (m_searchEdit && !m_searchEdit->text().trimmed().isEmpty()) ||
         (m_typeFilter && m_typeFilter->currentData().toInt() != -1) ||
         (m_floorFilter && !m_floorFilter->currentData().toString().isEmpty());
+}
+
+void ModelTreeWidget::applyFilter()
+{
+    if (!m_treeWidget) return;
+    const bool filtering = isFiltering();
+    const int horizontalPosition = m_treeWidget->horizontalScrollBar()->value();
+    const int verticalPosition = m_treeWidget->verticalScrollBar()->value();
     if (filtering) {
+        if (!m_filterWasActive) {
+            m_unfilteredTreeState = captureTreeState();
+            m_unfilteredVerticalPosition = verticalPosition;
+        }
         const QSignalBlocker blocker(m_treeWidget);
         for (int index = 0; index < m_treeWidget->topLevelItemCount(); ++index) {
             materializeAllChildren(m_treeWidget->topLevelItem(index));
         }
         m_filterWasActive = true;
     } else if (m_filterWasActive) {
-        m_filterWasActive = false;
         refresh();
         return;
     }
@@ -772,17 +910,18 @@ void ModelTreeWidget::applyFilter()
         QTreeWidgetItem* root = m_treeWidget->topLevelItem(index);
         root->setHidden(!filterItem(root));
     }
+    updateNameColumnWidth();
+    m_treeWidget->doItemsLayout();
+    m_treeWidget->horizontalScrollBar()->setValue(horizontalPosition);
+    m_treeWidget->verticalScrollBar()->setValue(verticalPosition);
 }
 
 void ModelTreeWidget::scrollToItemKeepingHierarchyVisible(QTreeWidgetItem* item)
 {
     if (!m_treeWidget || !item) return;
+    const int horizontalPosition = m_treeWidget->horizontalScrollBar()->value();
     m_treeWidget->scrollToItem(item, QAbstractItemView::PositionAtCenter);
-    // Qt may horizontally auto-scroll a deeply nested IFC item into view. That
-    // hides the parent hierarchy and makes the tree appear to be cut off.
-    if (QScrollBar* scrollBar = m_treeWidget->horizontalScrollBar()) {
-        scrollBar->setValue(0);
-    }
+    m_treeWidget->horizontalScrollBar()->setValue(horizontalPosition);
 }
 
 bool ModelTreeWidget::filterItem(QTreeWidgetItem* item)

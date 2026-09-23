@@ -9,6 +9,8 @@
 #include "comparison/FdsInputComparator.h"
 #include "fds/FdsExamples.h"
 #include "fds/FdsBlockConversionService.h"
+#include "fds/GeometryDerivedUpdateService.h"
+#include "modeling/GeometryEditDependencyService.h"
 #include "fds/FcFdsModel.h"
 #include "fds/FdsImporter.h"
 #include "fds/FcProjectSerializer.h"
@@ -50,6 +52,7 @@
 #include "ui/StartPageWidget.h"
 #include "ui/TutorialGuideWidget.h"
 #include "ui/SimulationTaskCenterWidget.h"
+#include "ui/SimulationStatusWidget.h"
 #include "ui/SimulationParametersDialog.h"
 #include "ui/SimulationRunDialog.h"
 #include "ui/UiLanguage.h"
@@ -61,6 +64,7 @@
 #include <BRepBndLib.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <Bnd_Box.hxx>
+#include <TopExp_Explorer.hxx>
 #include <Standard_Failure.hxx>
 #include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
@@ -110,6 +114,7 @@
 #include <QScreen>
 #include <QSaveFile>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSet>
 #include <QSpinBox>
 #include <QStatusBar>
@@ -266,7 +271,8 @@ gp_Pnt shapeCenter(const TopoDS_Shape& shape)
 }
 
 TopoDS_Shape applyTransform(const TopoDS_Shape& source,
-                            const GeometryTransformParameters& parameters)
+                            const GeometryTransformParameters& parameters,
+                            gp_Trsf* combinedTransform = nullptr)
 {
     TopoDS_Shape result = source;
     const gp_Pnt pivot = parameters.pivot == TransformPivot::ObjectCenter
@@ -274,8 +280,10 @@ TopoDS_Shape applyTransform(const TopoDS_Shape& source,
                              : parameters.pivot == TransformPivot::WorldOrigin
                                    ? gp_Pnt(0.0, 0.0, 0.0)
                                    : parameters.customPivot;
-    const auto apply = [&result](const gp_Trsf& transform) {
+    if(combinedTransform) *combinedTransform=gp_Trsf();
+    const auto apply = [&result, combinedTransform](const gp_Trsf& transform) {
         result = BRepBuilderAPI_Transform(result, transform, Standard_True).Shape();
+        if(combinedTransform) combinedTransform->PreMultiply(transform);
     };
     if (parameters.scale != 1.0) {
         gp_Trsf transform;
@@ -821,6 +829,38 @@ void copyGeometrySemantics(const FcGeometryObject& source,
     destination.setTags(source.tags());
     destination.setVisible(source.isVisible());
 }
+
+bool updateCopiedGeometryParameters(const FcDocument& document,
+                                    const FcGeometryObject& source,
+                                    FcGeometryObject& copy, const gp_Trsf& transform,
+                                    QString* error)
+{
+    QVector<std::shared_ptr<FcGeometryObject>> allGeometry;
+    collectGeometryObjects(document.geometryGroup(), allGeometry);
+    bool hasHostedObjects = !source.hostObjectId().isEmpty();
+    for (const auto& geometry : allGeometry)
+        hasHostedObjects = hasHostedObjects || geometry->hostObjectId() == source.id();
+    if (hasHostedObjects) {
+        *error = u("Copying hosted geometry requires rebuilding its host references. Copy the plain geometry and recreate its openings instead.");
+        return false;
+    }
+    const auto before = BuildingGeometryService::requestFromParameters(
+        source.geometryKind(), source.geometryParameters());
+    if (GeometryEditService::handles(before).isEmpty()) return true;
+    BuildingGeometryRequest after;
+    if (!GeometryEditService::matchesShape(before, source.shape(), 1e-6, error) ||
+        !GeometryEditService::transformRequest(before, transform, &after, error)) return false;
+    QSet<QString> faceKeys;
+    for (const auto& face : BuildingGeometryService::faceInfos(copy.shape())) faceKeys.insert(face.key);
+    for (auto it = copy.faceSurfaceIds().cbegin(); it != copy.faceSurfaceIds().cend(); ++it) {
+        if (it.key().startsWith(QStringLiteral("TopoFace:")) && !faceKeys.contains(it.key())) {
+            *error = u("Geometry changed a surface-assigned face. Reassign or clear the affected faces in Properties first.");
+            return false;
+        }
+    }
+    copy.setGeometryParameters(BuildingGeometryService::requestToParameters(after));
+    return true;
+}
 }
 
 MainWindow::MainWindow(QWidget* parent)
@@ -848,6 +888,11 @@ MainWindow::MainWindow(QWidget* parent)
     }
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks |
                    QMainWindow::AllowTabbedDocks);
+    // A logical-pixel drag target remains discoverable next to the native OCCT view.
+    // Keep this local so changing application theme does not remove the separator.
+    setStyleSheet(QStringLiteral(
+        "QMainWindow::separator { width: 7px; height: 7px; background: palette(midlight); }"
+        "QMainWindow::separator:hover { background: palette(highlight); }"));
 
     m_undoStack = new QUndoStack(this);
     createActions();
@@ -1057,6 +1102,10 @@ void MainWindow::createActions()
     m_resetLayoutAction->setObjectName(QStringLiteral("ResetLayoutAction"));
 
     m_createBoxAction = new QAction(QStringLiteral("Create Box"), this);
+    m_directEditAction = new QAction(u("Edit Dimensions in View"), this);
+    m_directEditAction->setObjectName(QStringLiteral("DirectGeometryEditAction"));
+    m_directEditAction->setCheckable(true);
+    m_directEditAction->setEnabled(false);
     m_createWallAction = new QAction(QStringLiteral("Create Wall"), this);
     m_createWallAction->setData(static_cast<int>(FcGeometryKind::Wall));
     m_drawWallAction = new QAction(QStringLiteral("Draw Wall in View..."), this);
@@ -1465,6 +1514,24 @@ void MainWindow::createToolBars()
     m_mainToolBar->addAction(m_validateAction);
     m_mainToolBar->addAction(m_runAction);
     m_mainToolBar->addAction(m_stopAction);
+    m_modelingToolBar = new QToolBar(u("Modeling Tools"), this);
+    m_modelingToolBar->setObjectName(QStringLiteral("ModelingToolbar"));
+    m_modelingToolBar->setMovable(true);
+    m_modelingToolBar->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    addToolBar(Qt::LeftToolBarArea, m_modelingToolBar);
+    m_modelingToolBar->addAction(m_drawWallAction);
+    m_modelingToolBar->addAction(m_createBoxAction);
+    for (QAction* action : m_buildingGeometryActions) {
+        const auto kind = static_cast<FcGeometryKind>(action->data().toInt());
+        if (kind == FcGeometryKind::Slab || kind == FcGeometryKind::PolygonPrism ||
+            kind == FcGeometryKind::RectangularOpening) m_modelingToolBar->addAction(action);
+    }
+    m_modelingToolBar->addSeparator();
+    for (QAction* action : {m_directEditAction, m_transformAction, m_assignSurfacesAction, m_measureAction})
+        m_modelingToolBar->addAction(action);
+    for (QAction* action : m_modelingToolBar->actions()) {
+        if (!action->isSeparator()) action->setToolTip(action->text());
+    }
     retranslateUi();
 }
 
@@ -1659,6 +1726,12 @@ void MainWindow::createCentralView()
 {
     m_centralStack = new QStackedWidget(this);
     m_centralStack->setObjectName(QStringLiteral("CentralWorkspaceStack"));
+    // QStackedWidget includes inactive pages in its minimum-size hint. The
+    // legacy results/record controls can request >2000 px, pinning the model
+    // dock to its 190 px minimum even while the resizable 3D page is active.
+    // Do not let those hidden pages reserve the entire horizontal workspace.
+    m_centralStack->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
+    m_centralStack->setMinimumWidth(280);
     m_startPageWidget = new StartPageWidget(m_centralStack);
     m_workspaceTabs = new QTabWidget(m_centralStack);
     m_workspaceTabs->setObjectName(QStringLiteral("MainWorkspaceTabs"));
@@ -1775,8 +1848,19 @@ void MainWindow::createCentralView()
 void MainWindow::createApplicationStatusBar()
 {
     statusBar()->showMessage(QStringLiteral("Ready"));
+    m_simulationStatusWidget = new SimulationStatusWidget(statusBar());
+    statusBar()->addPermanentWidget(m_simulationStatusWidget);
+    m_simulationStatusWidget->setManager(m_taskManager);
+    connect(m_simulationStatusWidget, &SimulationStatusWidget::detailsRequested,
+            this, [this](const QString& taskId) {
+                m_taskCenterWidget->selectTaskById(taskId);
+                m_taskCenterWidget->setDetailsExpanded(true);
+                m_taskCenterDock->show();
+                m_taskCenterDock->raise();
+            });
     m_snapStatusLabel = new QLabel(statusBar());
     m_snapStatusLabel->setObjectName(QStringLiteral("SnapStatusLabel"));
+    m_snapStatusLabel->setMaximumWidth(260);
     statusBar()->addPermanentWidget(m_snapStatusLabel);
     updateSnapStatus();
 }
@@ -1969,31 +2053,38 @@ void MainWindow::connectActions()
     connect(m_validateAction, &QAction::triggered,
             this, &MainWindow::validateCurrentProject);
     connect(m_editObjectAction, &QAction::triggered, this, [this]() {
-        if (!m_project || !m_project->document() || !m_modelTreeWidget) return;
-        const FcObject::Ptr object = m_project->document()->findObject(
-            m_modelTreeWidget->selectedObjectId());
-        if (std::dynamic_pointer_cast<FcFloorObject>(object)) {
-            editFloorObject(object->id());
-        } else if (std::dynamic_pointer_cast<FcGeometryObject>(object)) {
-            editSelectedBuildingGeometry();
-        } else {
-            editSelectedFdsObject();
-        }
+        if (m_modelTreeWidget) openObjectProperties(m_modelTreeWidget->selectedObjectId());
     });
+    connect(m_directEditAction, &QAction::toggled, this, &MainWindow::toggleDirectGeometryEditing);
+    connect(m_occViewWidget, &OccViewWidget::directEditEnded, this, [this]() {
+        const QSignalBlocker blocker(m_directEditAction);
+        m_directEditAction->setChecked(false);
+    });
+    connect(m_occViewWidget, &OccViewWidget::directEditStatus, this,
+            [this](const QString& text) { statusBar()->showMessage(text); });
+    connect(m_occViewWidget, &OccViewWidget::geometryEditRequested, this,
+        [this](const QString& id, const QVariantMap& parameters) {
+            const QString objectId=id; // endDirectEditing clears its internal ID synchronously.
+            QString error;
+            if (!commitGeometryParameters(objectId, parameters, &error)) {
+                QMessageBox::warning(this, u("Invalid Geometry"), UiLanguageManager::text(error));
+            }
+            toggleDirectGeometryEditing(true);
+        });
     connect(m_stopAction, &QAction::triggered, this, &MainWindow::stopFdsCase);
     connect(m_taskManager, &SimulationTaskManager::taskAdded, this,
             [this](const QString& taskId) {
                 const SimulationTaskRecord* task = m_taskManager->task(taskId);
                 if (!task) return;
-                m_taskCenterDock->show();
-                m_taskCenterDock->raise();
                 m_stopAction->setEnabled(true);
                 m_messageWidget->appendMessage(
                     QStringLiteral("[Info] FDS task queued: %1; backend=%2; processes=%3")
                         .arg(QDir::toNativeSeparators(task->request.inputFilePath),
                              task->backendName)
                         .arg(task->request.processCount));
-                statusBar()->showMessage(u("FDS calculation queued..."));
+                statusBar()->showMessage(task->environmentCheck.startsWith(QStringLiteral("Ready:"))
+                    ? u("Environment check passed. FDS calculation queued...")
+                    : u("FDS calculation queued..."), kStatusMessageDurationMs);
             });
     connect(m_taskManager, &SimulationTaskManager::taskUpdated, this,
             [this](const QString& taskId) {
@@ -2237,21 +2328,19 @@ void MainWindow::connectActions()
     });
     connect(m_restoreVisibilityAction, &QAction::triggered,
             this, &MainWindow::restoreModelVisibility);
+    connect(m_occViewWidget, &OccViewWidget::objectActivated,
+            this, &MainWindow::openObjectProperties);
+    connect(m_planViewWidget, &OccViewWidget::objectActivated,
+            this, &MainWindow::openObjectProperties);
     m_occViewWidget->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_occViewWidget, &QWidget::customContextMenuRequested,
             this, [this](const QPoint& position) {
         if (!m_occViewWidget || !m_occViewWidget->displayManager()) return;
-        const QStringList selectedIds =
+        const QString hit = m_occViewWidget->prepareContextSelection(position);
+        const QStringList selectedIds = hit.isEmpty() ? QStringList{} :
             m_occViewWidget->displayManager()->selectedObjectIds();
-        if (selectedIds.size() != 1) return;
-        QMenu menu(m_occViewWidget);
-        QAction* normalAction = menu.addAction(u("View Normal to Plane"));
-        connect(normalAction, &QAction::triggered, this,
-                [this, selectedIds]() {
-                    viewNormalToObject(selectedIds.constFirst());
-                });
-        menu.addAction(m_restoreViewAction);
-        menu.exec(m_occViewWidget->mapToGlobal(position));
+        std::unique_ptr<QMenu> menu(createModelContextMenu(selectedIds));
+        menu->exec(m_occViewWidget->mapToGlobal(position));
     });
     connect(m_fitSelectionAction, &QAction::triggered, this, [this]() {
         statusBar()->showMessage(
@@ -2551,19 +2640,7 @@ void MainWindow::connectActions()
             [this](const QString& objectId) { removeObject(objectId); });
     connect(m_modelTreeWidget,
             &ModelTreeWidget::editObjectRequested,
-            this,
-            [this](const QString& objectId) {
-                if (!m_project || !m_project->document()) return;
-                const FcObject::Ptr object =
-                    m_project->document()->findObject(objectId);
-                if (std::dynamic_pointer_cast<FcFloorObject>(object)) {
-                    editFloorObject(objectId);
-                } else if (std::dynamic_pointer_cast<FcGeometryObject>(object)) {
-                    editBuildingGeometry(objectId);
-                } else {
-                    editFdsObject(objectId);
-                }
-            });
+            this, &MainWindow::openObjectProperties);
     connect(m_modelTreeWidget,
             &ModelTreeWidget::duplicateObjectRequested,
             this,
@@ -2775,6 +2852,7 @@ void MainWindow::connectActions()
 
 void MainWindow::createNewProject()
 {
+    if(m_occViewWidget) {m_occViewWidget->endDirectEditing();m_occViewWidget->cancelWallSketch();}
     if (m_smokeviewHostWidget) {
         m_smokeviewHostWidget->closeViewer();
     }
@@ -2877,12 +2955,22 @@ void MainWindow::clearCurrentRecovery()
 
 bool MainWindow::confirmProjectReplacement(const QString& operationDescription)
 {
-    if (!m_project || !m_project->isModified()) return true;
+    const auto finish = [this](bool confirmed) {
+        if (confirmed) {
+            if (m_transformGizmoAction) m_transformGizmoAction->setChecked(false);
+            for (OccViewWidget* view : {m_occViewWidget, m_planViewWidget}) {
+                if (!view) continue;
+                view->endDirectEditing(); view->cancelWallSketch();
+            }
+        }
+        return confirmed;
+    };
+    if (!m_project || !m_project->isModified()) return finish(true);
     performAutoSave(QStringLiteral("Before %1").arg(operationDescription));
     if (qEnvironmentVariable("FIRECAE_AUTOMATION_DISCARD_UNSAVED") ==
         QStringLiteral("1")) {
         clearCurrentRecovery();
-        return true;
+        return finish(true);
     }
     QMessageBox prompt(QMessageBox::Warning, u("Unsaved Project"),
                        u("The current project has unsaved changes. Save them before %1?")
@@ -2897,10 +2985,10 @@ bool MainWindow::confirmProjectReplacement(const QString& operationDescription)
     if (answer == QMessageBox::Cancel) return false;
     if (answer == QMessageBox::Discard) {
         clearCurrentRecovery();
-        return true;
+        return finish(true);
     }
     saveCurrentProject();
-    return m_project && !m_project->isModified();
+    return finish(m_project && !m_project->isModified());
 }
 
 void MainWindow::offerRecoveryOnStartup()
@@ -2970,6 +3058,7 @@ bool MainWindow::confirmTutorialReplacement()
 
 void MainWindow::rebuildFdsScene(bool fitAll, const QString& selectedObjectId)
 {
+    if(m_occViewWidget) m_occViewWidget->endDirectEditing();
     if (!m_project || !m_occViewWidget || !m_occViewWidget->displayManager()) return;
     m_isolationActive = false;
     if (m_modelTreeWidget) m_modelTreeWidget->setIsolationActive(false);
@@ -2990,6 +3079,8 @@ void MainWindow::rebuildFdsScene(bool fitAll, const QString& selectedObjectId)
     const auto displayProjectGeometry = [this](GeometryDisplayManager* manager,
                                                 bool planView) {
         if (!manager) return;
+        QVector<std::shared_ptr<FcGeometryObject>> allGeometry;
+        collectGeometryObjects(m_project->document()->geometryGroup(), allGeometry);
         const std::function<void(const FcObject::Ptr&, bool)> displayGeometry =
         [&](const FcObject::Ptr& object, bool parentVisible) {
             if (!object) return;
@@ -3006,7 +3097,11 @@ void MainWindow::rebuildFdsScene(bool fitAll, const QString& selectedObjectId)
             }
             if (const auto geometry = std::dynamic_pointer_cast<FcGeometryObject>(object)) {
                 if (geometry->hasShape()) {
-                    manager->displayObject(geometry);
+                    const TopoDS_Shape displayShape=GeometryEditDependencyService::displayShape(*geometry,allGeometry);
+                    auto presentation=std::make_shared<FcGeometryObject>(geometry->name(),displayShape);
+                    copyGeometrySemantics(*geometry,*presentation);
+                    presentation->restorePersistentId(geometry->id());
+                    manager->displayObject(presentation);
                     if (!visible || (!planView &&
                         geometry->geometryKind() == FcGeometryKind::BackgroundImage)) {
                         manager->hideObject(geometry->id());
@@ -3112,6 +3207,135 @@ void MainWindow::applyFloorViewState(const QString& floorObjectId)
     updateBackgrounds(m_project->document()->geometryGroup());
 }
 
+QMenu* MainWindow::createModelContextMenu(const QStringList& objectIds)
+{
+    auto* menu = new QMenu(this);
+    menu->setObjectName(QStringLiteral("ModelContextMenu"));
+    QStringList ids;
+    if (m_project && m_project->document()) {
+        for (const QString& id : objectIds) {
+            if (!ids.contains(id) && m_project->document()->findObject(id)) ids.append(id);
+        }
+    }
+    const auto add = [menu](const QString& name, const QString& text,
+                            const std::function<void()>& callback) {
+        auto* action = menu->addAction(text);
+        action->setObjectName(name);
+        QObject::connect(action, &QAction::triggered, menu, callback);
+        return action;
+    };
+    if (!ids.isEmpty()) {
+        // The tree and all existing edit commands refer to the same UUID set.
+        updateMultiSelection(ids, true, true);
+        add(QStringLiteral("ContextHideSelected"), u("Hide Selected"),
+            [this]() { hideSelectedObjects(); });
+        add(QStringLiteral("ContextIsolateSelected"), u("Show Only Selected"),
+            [this, ids]() { isolateObjects(ids); });
+    }
+    if (m_isolationActive) {
+        add(QStringLiteral("ContextExitIsolation"), u("Exit Isolation"),
+            [this]() { if (m_isolationActive) restoreModelVisibility(); });
+    }
+    add(QStringLiteral("ContextShowAll"), u("Show All Objects"),
+        [this]() { showAllObjects(); });
+    menu->addAction(m_fitAllAction);
+    if (!ids.isEmpty()) {
+        menu->addAction(m_fitSelectionAction);
+        add(QStringLiteral("ContextLocateInTree"), u("Locate in Model Tree"), [this, ids]() {
+            m_modelTreeDock->show(); m_modelTreeDock->raise();
+            m_modelTreeWidget->selectObjectsByIds(ids);
+            if (ids.size() == 1) m_modelTreeWidget->selectObjectById(ids.constFirst(), true);
+        });
+        menu->addSeparator();
+        // Only offer operations backed by an applicable command, not placeholders.
+        for (QAction* action : {m_transformAction, m_copyMoveAction, m_mirrorAction,
+                                m_groupAction, m_batchRenameAction, m_assignSurfacesAction,
+                                m_duplicateAction, m_deleteAction}) {
+            if (action && action->isEnabled()) menu->addAction(action);
+        }
+        if (ids.size() == 1) {
+            const QString id = ids.constFirst();
+            add(QStringLiteral("ContextSelectSameType"), u("Select Same Type"), [this, id]() {
+                const auto source = m_project->document()->findObject(id);
+                if (!source) return;
+                const auto ifc = std::dynamic_pointer_cast<FcIfcObject>(source);
+                const auto geometry = std::dynamic_pointer_cast<FcGeometryObject>(source);
+                QStringList matching;
+                std::function<void(const FcObject::Ptr&)> visit = [&](const FcObject::Ptr& item) {
+                    if (!item) return;
+                    bool same = item->type() == source->type();
+                    if (same && ifc) {
+                        const auto candidate = std::dynamic_pointer_cast<FcIfcObject>(item);
+                        same = candidate && candidate->ifcClass() == ifc->ifcClass();
+                    }
+                    if (same && geometry) {
+                        const auto candidate = std::dynamic_pointer_cast<FcGeometryObject>(item);
+                        same = candidate && candidate->geometryKind() == geometry->geometryKind();
+                    }
+                    if (same) matching.append(item->id());
+                    for (const auto& child : item->children()) visit(child);
+                };
+                for (const auto& group : m_project->document()->groups()) visit(group);
+                updateMultiSelection(matching, true, true);
+            });
+            menu->addSeparator();
+            add(QStringLiteral("ContextViewNormal"), u("View Normal to Plane"),
+                [this, id]() { viewNormalToObject(id); });
+            add(QStringLiteral("ContextProperties"), u("Properties..."),
+                [this, id]() { openObjectProperties(id); });
+        }
+    }
+    menu->addAction(m_restoreViewAction);
+    return menu;
+}
+
+void MainWindow::openObjectProperties(const QString& objectId)
+{
+    if (!m_project || !m_project->document()) return;
+    const auto object = m_project->document()->findObject(objectId);
+    if (!object) return;
+    if (const auto geometry = std::dynamic_pointer_cast<FcGeometryObject>(object);
+        geometry && isLockedForModification(object.get()) &&
+        geometry->geometryKind() != FcGeometryKind::Generic &&
+        geometry->geometryKind() != FcGeometryKind::BackgroundImage) {
+        BuildingElementDialog dialog(geometry->geometryKind(), m_project.get(), this);
+        dialog.setExistingObject(geometry);
+        dialog.setReadOnly(u("This object is locked. Properties are read-only."));
+        connectGeometryPreview(dialog);
+        dialog.exec(); m_occViewWidget->clearGeometryPreview(); return;
+    }
+    if (!isLockedForModification(object.get())) {
+        if (const auto geometry = std::dynamic_pointer_cast<FcGeometryObject>(object);
+            geometry && geometry->geometryKind() != FcGeometryKind::Generic) {
+            editBuildingGeometry(objectId); return;
+        }
+        if (std::dynamic_pointer_cast<FcFloorObject>(object)) {
+            editFloorObject(objectId); return;
+        }
+        if (std::dynamic_pointer_cast<FcFdsNamelist>(object)) {
+            editFdsObject(objectId); return;
+        }
+    }
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("ReadOnlyObjectPropertiesDialog"));
+    dialog.setProperty("objectId", objectId);
+    dialog.setWindowTitle(u("Properties...") + QStringLiteral(" — ") + object->name());
+    dialog.resize(640, 580);
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* reason = new QLabel(isLockedForModification(object.get())
+        ? u("This object is locked. Properties are read-only.")
+        : std::dynamic_pointer_cast<FcGeometryObject>(object)
+            ? u("This geometry has no editable construction parameters. Its properties are read-only.")
+            : u("IFC/reference information is read-only. It is not an editable FDS obstruction."), &dialog);
+    reason->setWordWrap(true); layout->addWidget(reason);
+    auto* properties = new PropertiesWidget(&dialog);
+    properties->showObject(object.get()); layout->addWidget(properties, 1);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    dialog.exec();
+}
+
 void MainWindow::setObjectVisibility(const QString& objectId, bool visible)
 {
     if (!m_project || !m_project->document()) return;
@@ -3149,16 +3373,24 @@ void MainWindow::setObjectVisibility(const QString& objectId, bool visible)
 
 void MainWindow::isolateObject(const QString& objectId)
 {
+    isolateObjects({objectId});
+}
+
+void MainWindow::isolateObjects(const QStringList& objectIds)
+{
     if (!m_project || !m_project->document()) return;
-    const FcObject::Ptr object = m_project->document()->findObject(objectId);
-    if (!object) return;
     QSet<QString> visibleIds;
-    QVector<FcObject::Ptr> selectedSubtree;
-    collectObjectSubtree(object, selectedSubtree);
-    for (const FcObject::Ptr& current : selectedSubtree) visibleIds.insert(current->id());
-    for (FcObject* ancestor = object->parent(); ancestor; ancestor = ancestor->parent()) {
-        visibleIds.insert(ancestor->id());
+    for (const QString& objectId : objectIds) {
+        const FcObject::Ptr object = m_project->document()->findObject(objectId);
+        if (!object) continue;
+        QVector<FcObject::Ptr> selectedSubtree;
+        collectObjectSubtree(object, selectedSubtree);
+        for (const FcObject::Ptr& current : selectedSubtree) visibleIds.insert(current->id());
+        for (FcObject* ancestor = object->parent(); ancestor; ancestor = ancestor->parent()) {
+            visibleIds.insert(ancestor->id());
+        }
     }
+    if (visibleIds.isEmpty()) return;
     for (const auto& group : m_project->document()->groups()) {
         setTemporaryDisplayVisibilityRecursive(
             group, m_occViewWidget ? m_occViewWidget->displayManager() : nullptr,
@@ -3170,8 +3402,14 @@ void MainWindow::isolateObject(const QString& objectId)
     m_isolationActive = true;
     m_modelTreeWidget->setIsolationActive(true);
     m_restoreVisibilityAction->setText(u("Exit Isolation"));
-    m_modelTreeWidget->selectObjectById(objectId);
+    m_modelTreeWidget->selectObjectsByIds(objectIds);
     statusBar()->showMessage(u("Object isolated."), kStatusMessageDurationMs);
+}
+
+void MainWindow::showAllObjects()
+{
+    if (m_isolationActive) restoreModelVisibility();
+    restoreModelVisibility();
 }
 
 void MainWindow::restoreModelVisibility()
@@ -3393,6 +3631,8 @@ bool MainWindow::openProjectFile(const QString& filePath)
         return false;
     }
     if (m_smokeviewHostWidget) m_smokeviewHostWidget->closeViewer();
+    m_occViewWidget->endDirectEditing();
+    m_occViewWidget->cancelWallSketch();
     showModelWorkspace(0);
     if (m_occViewWidget && m_occViewWidget->displayManager()) {
         m_occViewWidget->displayManager()->clear();
@@ -5124,13 +5364,15 @@ void MainWindow::runAllScenarios()
     m_project->setModified(true);
     m_modelTreeWidget->refresh();
     rebuildFdsScene(true);
-    m_taskCenterDock->show();
-    m_taskCenterDock->raise();
     m_messageWidget->appendMessage(
         QStringLiteral("[Info] Scenario batch queued: %1 task(s), concurrency=%2, root=%3")
             .arg(queued).arg(concurrency).arg(QDir::toNativeSeparators(root)));
     for (const QString& error : errors) {
         m_messageWidget->appendMessage(QStringLiteral("[Error] %1").arg(error));
+    }
+    if (!errors.isEmpty()) {
+        m_messagesDock->show();
+        m_messagesDock->raise();
     }
     statusBar()->showMessage(u("Scenario batch queued."),
                              kStatusMessageDurationMs);
@@ -5151,7 +5393,7 @@ void MainWindow::updateMultiSelection(const QStringList& objectIds,
     bool allGeometry = !objectIds.isEmpty();
     for (const QString& id : objectIds) {
         const FcObject::Ptr object = m_project->document()->findObject(id);
-        if (!object || !object->isVisible()) continue;
+        if (!object) continue;
         validIds.append(id);
         names.append(object->name());
         allLocked = allLocked && object->isLocked();
@@ -5199,13 +5441,25 @@ void MainWindow::updateMultiSelection(const QStringList& objectIds,
         hasSelection && allRemovable && !anyLocked &&
         (validIds.size() == 1 || allGeometry));
     bool singleEditable = false;
-    if (validIds.size() == 1 && !anyLocked) {
+    if (validIds.size() == 1) {
         const FcObject::Ptr selected = m_project->document()->findObject(validIds.constFirst());
         singleEditable = static_cast<bool>(std::dynamic_pointer_cast<FcFdsNamelist>(selected)) ||
                          static_cast<bool>(std::dynamic_pointer_cast<FcGeometryObject>(selected)) ||
-                         static_cast<bool>(std::dynamic_pointer_cast<FcFloorObject>(selected));
+                         static_cast<bool>(std::dynamic_pointer_cast<FcFloorObject>(selected)) ||
+                         static_cast<bool>(std::dynamic_pointer_cast<FcIfcObject>(selected));
     }
     m_editObjectAction->setEnabled(singleEditable);
+    bool directSupported = false;
+    if (validIds.size() == 1 && !anyLocked) {
+        const auto geometry = std::dynamic_pointer_cast<FcGeometryObject>(
+            m_project->document()->findObject(validIds.constFirst()));
+        directSupported = geometry && !GeometryEditService::handles(
+            BuildingGeometryService::requestFromParameters(geometry->geometryKind(), geometry->geometryParameters())).isEmpty();
+    }
+    m_directEditAction->setEnabled(directSupported);
+    const QString editingId = m_occViewWidget->directEditingObjectId();
+    if (!editingId.isEmpty() && (!directSupported || validIds.size()!=1 || validIds.constFirst()!=editingId))
+        m_occViewWidget->endDirectEditing();
     if (m_transformGizmoAction->isChecked()) {
         if (!m_occViewWidget->showTransformManipulator(unlockedGeometryIds)) {
             m_transformGizmoAction->setChecked(false);
@@ -5471,6 +5725,7 @@ void MainWindow::updateSnapStatus(const QString& detail)
     const SnapSettings& settings = m_snapManager->settings();
     if (!settings.enabled || m_snapManager->isTemporarilyDisabled()) {
         m_snapStatusLabel->setText(u("Snap: Off"));
+        m_snapStatusLabel->setToolTip(u("Snap: Off"));
         return;
     }
     QStringList modes;
@@ -5487,6 +5742,7 @@ void MainWindow::updateSnapStatus(const QString& detail)
     QString text = QStringLiteral("%1: %2").arg(u("Snap"), modes.join(QStringLiteral("/")));
     if (!detail.isEmpty()) text += QStringLiteral(" | ") + detail;
     m_snapStatusLabel->setText(text);
+    m_snapStatusLabel->setToolTip(text);
 }
 
 void MainWindow::commitManipulatorTransform(const QStringList& objectIds)
@@ -5593,10 +5849,13 @@ void MainWindow::commitManipulatorTransform(const QStringList& objectIds)
     QVector<TopoDS_Shape> after;
     after.reserve(before.size());
     const double scale = rawTransform.ScaleFactor();
+    gp_Trsf committedTransform;
     for (const TopoDS_Shape& source : before) {
         TopoDS_Shape result = source;
-        const auto apply = [&result](const gp_Trsf& transform) {
+        gp_Trsf combined;
+        const auto apply = [&result, &combined](const gp_Trsf& transform) {
             result = BRepBuilderAPI_Transform(result, transform, Standard_True).Shape();
+            combined.PreMultiply(transform);
         };
         if (std::abs(scale - 1.0) > 1.0e-12) {
             gp_Trsf scaleTransform;
@@ -5616,6 +5875,15 @@ void MainWindow::commitManipulatorTransform(const QStringList& objectIds)
             apply(translationTransform);
         }
         after.append(result);
+        committedTransform=combined;
+    }
+    bool hasParametric=false;
+    for(const auto& object:objects) hasParametric=hasParametric || !GeometryEditService::handles(
+        BuildingGeometryService::requestFromParameters(object->geometryKind(),object->geometryParameters())).isEmpty();
+    if(hasParametric) {
+        for(const auto& object:objects) displayManager->displayObject(object);
+        commitParametricTransforms(transformedIds,QVector<gp_Trsf>(transformedIds.size(),committedTransform));
+        return;
     }
     const auto applyShapes = [this, objects, transformedIds](
                                  const QVector<TopoDS_Shape>& shapes) {
@@ -5675,12 +5943,19 @@ void MainWindow::transformSelectedGeometry()
                                   parameters)) return;
     QVector<TopoDS_Shape> before;
     QVector<TopoDS_Shape> after;
+    QVector<gp_Trsf> transforms;
     QStringList ids;
     for (const auto& object : objects) {
         before.append(object->shape());
-        after.append(applyTransform(object->shape(), parameters));
+        gp_Trsf transform;
+        after.append(applyTransform(object->shape(), parameters, &transform));
+        transforms.append(transform);
         ids.append(object->id());
     }
+    bool hasParametric=false;
+    for(const auto& object:objects) hasParametric=hasParametric || !GeometryEditService::handles(
+        BuildingGeometryService::requestFromParameters(object->geometryKind(),object->geometryParameters())).isEmpty();
+    if(hasParametric) {commitParametricTransforms(ids,transforms);return;}
     const auto applyShapes = [this, objects, ids](const QVector<TopoDS_Shape>& shapes) {
         for (qsizetype index = 0; index < objects.size(); ++index) {
             objects[index]->setShape(shapes[index]);
@@ -5735,10 +6010,15 @@ void MainWindow::copyMoveSelectedGeometry()
     QVector<FcObject*> copyParents;
     QStringList ids;
     for (const auto& source : sources) {
+        gp_Trsf transform;
         auto copy = std::make_shared<FcGeometryObject>(
             source->name() + QStringLiteral(" Copy"),
-            applyTransform(source->shape(), parameters));
+            applyTransform(source->shape(), parameters, &transform));
         copyGeometrySemantics(*source, *copy);
+        QString error;
+        if (!updateCopiedGeometryParameters(*m_project->document(), *source, *copy, transform, &error)) {
+            QMessageBox::warning(this, u("Invalid Geometry"), UiLanguageManager::text(error)); return;
+        }
         copies.append(copy);
         copyParents.append(source->parent());
         ids.append(copy->id());
@@ -5822,10 +6102,15 @@ void MainWindow::arraySelectedGeometry()
                 parameters.dy = m_project->displayToMeters(sy->value()) * iy;
                 parameters.dz = m_project->displayToMeters(sz->value()) * iz;
                 for (const auto& source : sources) {
+                    gp_Trsf transform;
                     auto copy = std::make_shared<FcGeometryObject>(
                         QStringLiteral("%1 [%2,%3,%4]").arg(source->name()).arg(ix).arg(iy).arg(iz),
-                        applyTransform(source->shape(), parameters));
+                        applyTransform(source->shape(), parameters, &transform));
                     copyGeometrySemantics(*source, *copy);
+                    QString error;
+                    if (!updateCopiedGeometryParameters(*m_project->document(), *source, *copy, transform, &error)) {
+                        QMessageBox::warning(this, u("Invalid Geometry"), UiLanguageManager::text(error)); return;
+                    }
                     copies.append(copy);
                     copyParents.append(source->parent());
                     ids.append(copy->id());
@@ -6073,10 +6358,10 @@ void MainWindow::copySelectedGeometryToFloor()
             BRepBuilderAPI_Transform(source->shape(), transform, Standard_True).Shape());
         copyGeometrySemantics(*source, *copy);
         copy->setFloorName(targetFloor->name());
-        BuildingGeometryRequest request = BuildingGeometryService::requestFromParameters(
-            copy->geometryKind(), copy->geometryParameters());
-        request.z += dz;
-        copy->setGeometryParameters(BuildingGeometryService::requestToParameters(request));
+        QString error;
+        if (!updateCopiedGeometryParameters(*m_project->document(), *source, *copy, transform, &error)) {
+            QMessageBox::warning(this, u("Invalid Geometry"), UiLanguageManager::text(error)); return;
+        }
         copies.append(copy);
         ids.append(copy->id());
     }
@@ -6253,17 +6538,27 @@ void MainWindow::editFloorObject(const QString& objectId)
 void MainWindow::hideSelectedObjects()
 {
     if (!m_project || !m_project->document()) return;
+    if (m_isolationActive) restoreModelVisibility();
     QVector<FcObject::Ptr> objects;
     QVector<bool> before;
+    QSet<QString> visited;
     for (const QString& id : m_modelTreeWidget->selectedObjectIds()) {
         const FcObject::Ptr object = m_project->document()->findObject(id);
-        if (object) { objects.append(object); before.append(object->isVisible()); }
+        QVector<FcObject::Ptr> subtree;
+        if (object) collectObjectSubtree(object, subtree);
+        for (const auto& child : subtree) {
+            if (visited.contains(child->id())) continue;
+            visited.insert(child->id()); objects.append(child); before.append(child->isVisible());
+        }
     }
     if (objects.isEmpty()) return;
     const auto applyVisibility = [this, objects](const QVector<bool>& values) {
         for (qsizetype index = 0; index < objects.size(); ++index) {
             objects[index]->setVisible(values[index]);
-            updateDisplayVisibilityRecursive(objects[index], m_occViewWidget->displayManager());
+        }
+        for (const auto& group : m_project->document()->groups()) {
+            restoreDisplayVisibilityRecursive(group, m_occViewWidget->displayManager());
+            restoreDisplayVisibilityRecursive(group, m_planViewWidget->displayManager());
         }
         m_project->setModified(true); m_modelTreeWidget->refresh(); updateWindowTitle();
     };
@@ -6585,8 +6880,34 @@ void MainWindow::createBuildingElement(int geometryKind)
             defaults.thickness = activeFloor->defaultSlabThickness();
         }
         dialog.setInitialRequest(defaults);
+        if(auto* groups=dialog.findChild<QComboBox*>(QStringLiteral("GeometryGroupCombo")))
+            groups->setCurrentIndex(groups->findData(activeFloor->id()));
     }
-    if (dialog.exec() != QDialog::Accepted) return;
+    if (BuildingGeometryService::isOpeningKind(kind)) {
+        const auto host=std::dynamic_pointer_cast<FcGeometryObject>(selected);
+        if (host && host->geometryKind()==FcGeometryKind::Wall) {
+            const auto wall=BuildingGeometryService::requestFromParameters(host->geometryKind(),host->geometryParameters());
+            const double length=std::hypot(wall.endX-wall.x,wall.endY-wall.y);
+            if(length>1e-6) {
+                BuildingGeometryRequest opening;
+                opening.kind=kind; opening.width=std::min(1.0,length*0.5);
+                opening.height=std::min(2.0,wall.height*0.7); opening.depth=wall.thickness+0.02;
+                const double side=wall.baseline==FcWallBaseline::Center ? -wall.thickness/2 :
+                                  wall.baseline==FcWallBaseline::Right ? -wall.thickness : 0;
+                const double tx=(wall.endX-wall.x)/length,ty=(wall.endY-wall.y)/length;
+                opening.x=wall.x+tx*(length-opening.width)/2-ty*(side-0.01);
+                opening.y=wall.y+ty*(length-opening.width)/2+tx*(side-0.01);
+                opening.z=wall.z; opening.rotationDegrees=std::atan2(ty,tx)*180/std::acos(-1.0);
+                dialog.setInitialRequest(opening);
+                if(auto* combo=dialog.findChild<QComboBox*>(QStringLiteral("OpeningHostCombo")))
+                    combo->setCurrentIndex(combo->findData(host->id()));
+            }
+        }
+    }
+    connectGeometryPreview(dialog);
+    const int outcome = dialog.exec();
+    m_occViewWidget->clearGeometryPreview();
+    if (outcome != QDialog::Accepted) return;
     QString error;
     BuildingGeometryRequest request = dialog.request();
     if (BuildingGeometryService::isOpeningKind(request.kind) &&
@@ -6612,6 +6933,17 @@ void MainWindow::createBuildingElement(int geometryKind)
     object->setDefaultSurfaceId(dialog.surfaceObjectId());
     object->setFaceSurfaceIds(dialog.faceSurfaceIds());
     object->setDynamicOpening(dialog.dynamicOpening());
+    if (!object->hostObjectId().isEmpty()) {
+        const auto host=std::dynamic_pointer_cast<FcGeometryObject>(m_project->document()->findObject(object->hostObjectId()));
+        const QString placement=host ? GeometryEditDependencyService::validateOpeningPlacement(request,
+            BuildingGeometryService::requestFromParameters(host->geometryKind(),host->geometryParameters()))
+            : u("The opening host no longer exists.");
+        if(!placement.isEmpty()) {QMessageBox::warning(this,u("Invalid Geometry"),UiLanguageManager::text(placement));return;}
+    }
+    if (!dialog.groupObjectId().isEmpty()) {
+        const auto chosen=m_project->document()->findObject(dialog.groupObjectId());
+        if(chosen && !isLockedForModification(chosen.get())) insertionParent=chosen;
+    }
     if (activeFloor) object->setFloorName(activeFloor->name());
     const auto applyPresence = [this, object, insertionParent](bool present) {
         if (present) {
@@ -6776,6 +7108,8 @@ void MainWindow::startInteractiveWallDrawing()
         }
     }
     m_wallSketchView = sketchView;
+    m_transformGizmoAction->setChecked(false);
+    sketchView->endDirectEditing();
     sketchView->setWallSketchSnapPoints(snapPoints);
     sketchView->setPerspective(false);
     sketchView->setOrientation(OccViewOrientation::Top);
@@ -6902,6 +7236,50 @@ void MainWindow::finishInteractiveWallDrawing(double startX, double startY,
     }
 }
 
+void MainWindow::connectGeometryPreview(BuildingElementDialog& dialog)
+{
+    connect(&dialog, &BuildingElementDialog::geometryPreviewRequested,
+            m_occViewWidget, &OccViewWidget::showGeometryPreview);
+    connect(&dialog, &BuildingElementDialog::facePreviewRequested, this,
+        [this, &dialog](const QString& key) {
+            const TopoDS_Shape shape=BuildingGeometryService::createShape(dialog.request());
+            const auto faces=BuildingGeometryService::faceInfos(shape);
+            for (const auto& face:faces) {
+                if (face.key!=key) continue;
+                int index=0;
+                for(TopExp_Explorer it(shape,TopAbs_FACE);it.More();it.Next()) {
+                    if(++index==face.faceIndex) {m_occViewWidget->showGeometryPreview(it.Current());return;}
+                }
+            }
+        });
+}
+
+void MainWindow::toggleDirectGeometryEditing(bool enabled)
+{
+    if (!enabled) {m_occViewWidget->endDirectEditing();return;}
+    if (!m_project || !m_project->document()) return;
+    const auto object=std::dynamic_pointer_cast<FcGeometryObject>(
+        m_project->document()->findObject(m_modelTreeWidget->selectedObjectId()));
+    if (!object || isLockedForModification(object.get())) return;
+    QString consistencyError;
+    if(!GeometryEditService::matchesShape(BuildingGeometryService::requestFromParameters(
+        object->geometryKind(),object->geometryParameters()),object->shape(),1e-6,&consistencyError)) {
+        const QSignalBlocker blocker(m_directEditAction);m_directEditAction->setChecked(false);
+        QMessageBox::warning(this,u("Invalid Geometry"),UiLanguageManager::text(consistencyError));return;
+    }
+    m_transformGizmoAction->setChecked(false);
+    const bool started=m_occViewWidget->beginDirectEditing(object->id(),
+        BuildingGeometryService::requestFromParameters(object->geometryKind(),object->geometryParameters()),
+        m_snapManager->settings().enabled ? (m_snapManager->settings().fdsGrid
+            ? m_snapManager->settings().fdsGridStep : (m_snapManager->settings().worldGrid
+                ? m_snapManager->settings().worldGridStep : 0.0)) : 0.0);
+    const QSignalBlocker blocker(m_directEditAction);
+    m_directEditAction->setChecked(started);
+    statusBar()->showMessage(started
+        ? u("Drag an orange handle; double-click for exact meters. Polygon points: Shift selects V, otherwise U. Esc cancels. Grid snap uses the current step.")
+        : u("Direct editing supports boxes, straight walls, slabs and polygon extrusions only."));
+}
+
 void MainWindow::editSelectedBuildingGeometry()
 {
     if (m_modelTreeWidget) editBuildingGeometry(m_modelTreeWidget->selectedObjectId());
@@ -6913,6 +7291,9 @@ void MainWindow::editBuildingGeometry(const QString& objectId)
     const auto object = std::dynamic_pointer_cast<FcGeometryObject>(
         m_project->document()->findObject(objectId));
     if (!object || isLockedForModification(object.get())) return;
+    if (object->geometryKind() == FcGeometryKind::Generic) {
+        openObjectProperties(objectId); return;
+    }
     if (object->geometryKind() == FcGeometryKind::BackgroundImage) {
         QDialog backgroundDialog(this);
         backgroundDialog.setObjectName(QStringLiteral("EditBackgroundImageDialog"));
@@ -6988,26 +7369,101 @@ void MainWindow::editBuildingGeometry(const QString& objectId)
     BuildingElementDialog dialog(object->geometryKind(), m_project.get(), this);
     dialog.setObjectName(QStringLiteral("EditBuildingElementDialog"));
     dialog.setExistingObject(object);
-    if (dialog.exec() != QDialog::Accepted) return;
+    connectGeometryPreview(dialog);
+    const int outcome = dialog.exec();
+    m_occViewWidget->clearGeometryPreview();
+    if (outcome != QDialog::Accepted) return;
+    QString error;
+    if (!applyBuildingGeometryEdit(objectId, dialog.request(), dialog.geometryName(),
+        dialog.hostObjectId(), dialog.controlObjectId(), dialog.surfaceObjectId(),
+        dialog.faceSurfaceIds(), dialog.dynamicOpening(), dialog.groupObjectId(), &error))
+        QMessageBox::warning(this, u("Invalid Geometry"), UiLanguageManager::text(error));
+}
+
+bool MainWindow::commitParametricTransforms(const QStringList& ids,const QVector<gp_Trsf>& transforms)
+{
+    if(!m_project || ids.size()!=transforms.size())return false;
+    QVector<QVariantMap> parameters;
+    QStringList targets;
+    for(int i=0;i<ids.size();++i) {
+        const auto object=std::dynamic_pointer_cast<FcGeometryObject>(m_project->document()->findObject(ids[i]));
+        if(!object)return false;
+        // An attached opening follows its selected host in the host transaction.
+        if(ids.contains(object->hostObjectId()))continue;
+        BuildingGeometryRequest next;
+        QString error;
+        const auto before=BuildingGeometryService::requestFromParameters(object->geometryKind(),object->geometryParameters());
+        if(!GeometryEditService::transformRequest(before,transforms[i],&next,&error) ||
+           !commitGeometryParameters(ids[i],BuildingGeometryService::requestToParameters(next),&error,true)) {
+            QMessageBox::warning(this,u("Invalid Geometry"),UiLanguageManager::text(error));return false;
+        }
+        parameters.append(BuildingGeometryService::requestToParameters(next));targets.append(ids[i]);
+    }
+    m_undoStack->beginMacro(u("Transform Geometry"));
+    bool ok=true;
+    for(int i=0;i<targets.size();++i) {
+        QString error;
+        if(!commitGeometryParameters(targets[i],parameters[i],&error)) {ok=false;break;}
+    }
+    m_undoStack->endMacro();
+    if(!ok)m_undoStack->undo();
+    updateMultiSelection(ids,true,true);
+    return ok;
+}
+
+bool MainWindow::commitGeometryParameters(const QString& objectId, const QVariantMap& parameters, QString* error, bool validateOnly)
+{
+    if (!m_project || !m_project->document()) return false;
+    const auto object=std::dynamic_pointer_cast<FcGeometryObject>(m_project->document()->findObject(objectId));
+    if (!object) return false;
+    return applyBuildingGeometryEdit(objectId,
+        BuildingGeometryService::requestFromParameters(object->geometryKind(),parameters), object->name(),
+        object->hostObjectId(),object->controlObjectId(),object->defaultSurfaceId(),object->faceSurfaceIds(),
+        object->isDynamicOpening(),object->parent()?object->parent()->id():QString{},error,validateOnly);
+}
+
+bool MainWindow::applyBuildingGeometryEdit(const QString& objectId, BuildingGeometryRequest request,
+    const QString& afterName, const QString& afterHost, const QString& afterControl,
+    const QString& afterSurface, const QMap<QString,QString>& afterFaceSurfaces, bool afterDynamic,
+    const QString& groupId, QString* errorMessage, bool validateOnly)
+{
+    const auto fail=[errorMessage](const QString& text) { if(errorMessage)*errorMessage=text; return false; };
+    if (errorMessage) errorMessage->clear();
+    if (!m_project || !m_project->document()) return false;
+    const auto object=std::dynamic_pointer_cast<FcGeometryObject>(m_project->document()->findObject(objectId));
+    if (!object || isLockedForModification(object.get())) return fail(u("Locked objects cannot be modified."));
     QString error;
     const BuildingGeometryRequest previousRequest =
         BuildingGeometryService::requestFromParameters(
             object->geometryKind(), object->geometryParameters());
-    BuildingGeometryRequest request = dialog.request();
+    if(!GeometryEditService::handles(previousRequest).isEmpty() &&
+       !GeometryEditService::matchesShape(previousRequest,object->shape(),1e-6,&error)) return fail(UiLanguageManager::text(error));
     if (BuildingGeometryService::isOpeningKind(request.kind) &&
-        !dialog.hostObjectId().isEmpty()) {
+        !afterHost.isEmpty()) {
         const auto host = std::dynamic_pointer_cast<FcGeometryObject>(
-            m_project->document()->findObject(dialog.hostObjectId()));
+            m_project->document()->findObject(afterHost));
         if (host && host->geometryKind() == FcGeometryKind::Wall) {
             request = BuildingGeometryService::attachOpeningToWall(
                 request, BuildingGeometryService::requestFromParameters(
                              host->geometryKind(), host->geometryParameters()));
         }
+        if(!host) return fail(u("The opening host no longer exists."));
+        if(isLockedForModification(host.get())) return fail(u("Locked objects cannot be modified."));
+        const QString placement=GeometryEditDependencyService::validateOpeningPlacement(request,
+            BuildingGeometryService::requestFromParameters(host->geometryKind(),host->geometryParameters()));
+        if(!placement.isEmpty()) return fail(UiLanguageManager::text(placement));
+    }
+    auto dependencyObject=std::make_shared<FcGeometryObject>(object->name(),object->shape());
+    copyGeometrySemantics(*object,*dependencyObject);dependencyObject->restorePersistentId(objectId);
+    dependencyObject->setHostObjectId(afterHost);
+    const QStringList dependencyErrors=GeometryEditDependencyService::validate(*m_project->document(),*dependencyObject,request);
+    if(!dependencyErrors.isEmpty()) {
+        QStringList translated;for(const QString& message:dependencyErrors) translated.append(UiLanguageManager::text(message));
+        return fail(translated.join(QLatin1Char('\n')));
     }
     const TopoDS_Shape afterShape = BuildingGeometryService::createShape(request, &error);
     if (afterShape.IsNull()) {
-        QMessageBox::critical(this, u("Invalid Geometry"), error);
-        return;
+        return fail(error);
     }
     const QString beforeName = object->name();
     const TopoDS_Shape beforeShape = object->shape();
@@ -7018,16 +7474,24 @@ void MainWindow::editBuildingGeometry(const QString& objectId)
     const QString beforeSurface = object->defaultSurfaceId();
     const QMap<QString, QString> beforeFaceSurfaces = object->faceSurfaceIds();
     const bool beforeDynamic = object->isDynamicOpening();
-    const QString afterName = dialog.geometryName();
     const QVariantMap afterParameters = BuildingGeometryService::requestToParameters(request);
-    const QString afterHost = dialog.hostObjectId();
-    const QString afterControl = dialog.controlObjectId();
-    const QString afterSurface = dialog.surfaceObjectId();
-    const QMap<QString, QString> afterFaceSurfaces = dialog.faceSurfaceIds();
-    const bool afterDynamic = dialog.dynamicOpening();
+    const auto beforeParent=m_project->document()->findObject(object->parent()->id());
+    const auto afterParent=groupId.isEmpty()?beforeParent:m_project->document()->findObject(groupId);
+    if (!afterParent || isLockedForModification(afterParent.get()) ||
+        (afterParent->type()!=FcObjectType::Group && afterParent->type()!=FcObjectType::Folder &&
+         afterParent->type()!=FcObjectType::Floor)) return fail(u("Invalid geometry group."));
+    for(FcObject* ancestor=afterParent.get();ancestor;ancestor=ancestor->parent())
+        if(ancestor==object.get()) return fail(u("Invalid geometry group."));
+    QSet<QString> faceKeys;
+    for(const auto& face:BuildingGeometryService::faceInfos(afterShape)) faceKeys.insert(face.key);
+    for(auto it=afterFaceSurfaces.cbegin();it!=afterFaceSurfaces.cend();++it) {
+        if(it.key().startsWith(QStringLiteral("TopoFace:")) && !faceKeys.contains(it.key()))
+            return fail(u("Geometry changed a surface-assigned face. Reassign or clear the affected faces in Properties first."));
+    }
     QVector<HostedGeometryState> beforeHosted;
     QVector<HostedGeometryState> afterHosted;
-    if (beforeKind == FcGeometryKind::Wall && request.kind == FcGeometryKind::Wall) {
+    if (beforeKind == FcGeometryKind::Wall && request.kind == FcGeometryKind::Wall &&
+        GeometryEditDependencyService::geometryChanged(*object,request)) {
         QVector<std::shared_ptr<FcGeometryObject>> allGeometry;
         collectGeometryObjects(m_project->document()->geometryGroup(), allGeometry);
         for (const auto& hosted : allGeometry) {
@@ -7036,24 +7500,53 @@ void MainWindow::editBuildingGeometry(const QString& objectId)
             const BuildingGeometryRequest oldOpening =
                 BuildingGeometryService::requestFromParameters(
                     hosted->geometryKind(), hosted->geometryParameters());
-            const BuildingGeometryRequest newOpening =
-                BuildingGeometryService::followEditedHostWall(
-                    oldOpening, previousRequest, request);
             QString hostedError;
+            const BuildingGeometryRequest newOpening =
+                GeometryEditDependencyService::updatedHostedOpening(
+                    oldOpening, previousRequest, request, &hostedError);
+            if(!hostedError.isEmpty()) return fail(UiLanguageManager::text(hostedError));
             const TopoDS_Shape hostedShape =
                 BuildingGeometryService::createShape(newOpening, &hostedError);
             if (hostedShape.IsNull()) {
-                QMessageBox::critical(
-                    this, u("Invalid Geometry"),
-                    QStringLiteral("%1: %2").arg(hosted->name(), hostedError));
-                return;
+                return fail(QStringLiteral("%1: %2").arg(hosted->name(), hostedError));
             }
             beforeHosted.append({hosted, hosted->shape(), hosted->geometryParameters()});
             afterHosted.append({hosted, hostedShape,
                                 BuildingGeometryService::requestToParameters(newOpening)});
         }
     }
-    const auto apply = [this, object](const QString& name,
+    QVector<std::shared_ptr<FcFdsMesh>> meshes;
+    std::function<void(const FcObject::Ptr&)> collectMeshes=[&](const FcObject::Ptr& item) {
+        if(!item)return;
+        if(auto mesh=meshForGeometryConversion(item)) meshes.append(mesh);
+        for(const auto& child:item->children()) collectMeshes(child);
+    };
+    collectMeshes(m_project->document()->meshesGroup());
+    auto nextObject=std::make_shared<FcGeometryObject>(afterName,afterShape);
+    copyGeometrySemantics(*object,*nextObject); nextObject->restorePersistentId(objectId);
+    nextObject->setGeometryKind(request.kind);nextObject->setGeometryParameters(afterParameters);
+    nextObject->setHostObjectId(afterHost);nextObject->setControlObjectId(afterControl);
+    nextObject->setDefaultSurfaceId(afterSurface);nextObject->setFaceSurfaceIds(afterFaceSurfaces);
+    nextObject->setDynamicOpening(afterDynamic);
+    const auto translatedErrors=[](const QStringList& errors) {
+        QStringList translated;
+        for(const QString& message:errors) translated.append(UiLanguageManager::text(message));
+        return translated.join(QLatin1Char('\n'));
+    };
+    const auto surfaceErrors=FdsBlockConversionService::validateSurfaceAssignments(*nextObject);
+    if(!surfaceErrors.isEmpty())return fail(translatedErrors(surfaceErrors));
+    auto derived=GeometryDerivedUpdateService::plan(*m_project->document(),object,nextObject,meshes);
+    if(!derived.success()) return fail(translatedErrors(derived.errors));
+    for(const auto& hosted:afterHosted) {
+        auto nextHosted=std::make_shared<FcGeometryObject>(hosted.object->name(),hosted.shape);
+        copyGeometrySemantics(*hosted.object,*nextHosted);nextHosted->restorePersistentId(hosted.object->id());
+        nextHosted->setGeometryParameters(hosted.parameters);
+        const auto plan=GeometryDerivedUpdateService::plan(*m_project->document(),hosted.object,nextHosted,meshes);
+        if(!plan.success()) return fail(translatedErrors(plan.errors));
+        derived.updates+=plan.updates;
+    }
+    if(validateOnly)return true;
+    const auto apply = [this, object, derived](const QString& name,
                                       const TopoDS_Shape& shape,
                                       FcGeometryKind kind,
                                       const QVariantMap& parameters,
@@ -7062,12 +7555,20 @@ void MainWindow::editBuildingGeometry(const QString& objectId)
                                       const QString& surface,
                                       const QMap<QString, QString>& faceSurfaces,
                                       bool dynamic,
-                                      const QVector<HostedGeometryState>& hostedStates) {
+                                      const QVector<HostedGeometryState>& hostedStates,
+                                      const FcObject::Ptr& parent, bool forward) {
+        m_occViewWidget->endDirectEditing();
+        if (parent && object->parent()!=parent.get()) {
+            if(object->parent()) object->parent()->removeChild(object->id());
+            parent->addChild(object);
+        }
         object->setName(name); object->setShape(shape); object->setGeometryKind(kind);
         object->setGeometryParameters(parameters); object->setHostObjectId(host);
         object->setControlObjectId(control); object->setDefaultSurfaceId(surface);
         object->setFaceSurfaceIds(faceSurfaces);
         object->setDynamicOpening(dynamic);
+        for(const auto& change:derived.updates)
+            change.target->setParameters(forward ? change.afterParameters : change.beforeParameters);
         if (GeometryDisplayManager* manager = m_occViewWidget->displayManager()) {
             manager->displayObject(object); manager->selectObject(object->id());
             for (const HostedGeometryState& state : hostedStates) {
@@ -7083,6 +7584,7 @@ void MainWindow::editBuildingGeometry(const QString& objectId)
                 state.object->setGeometryParameters(state.parameters);
             }
         }
+        rebuildFdsScene(false, object->id());
         m_project->setModified(true); m_currentFdsPath.clear();
         m_modelTreeWidget->refresh(); m_modelTreeWidget->selectObjectById(object->id());
         m_propertiesWidget->showObject(object.get()); updateWindowTitle();
@@ -7091,10 +7593,11 @@ void MainWindow::editBuildingGeometry(const QString& objectId)
         u("Edit Building Geometry"),
         [=]() { apply(afterName, afterShape, request.kind, afterParameters,
                       afterHost, afterControl, afterSurface, afterFaceSurfaces,
-                      afterDynamic, afterHosted); },
+                      afterDynamic, afterHosted, afterParent, true); },
         [=]() { apply(beforeName, beforeShape, beforeKind, beforeParameters,
                       beforeHost, beforeControl, beforeSurface, beforeFaceSurfaces,
-                      beforeDynamic, beforeHosted); }));
+                      beforeDynamic, beforeHosted, beforeParent, false); }));
+    return true;
 }
 
 void MainWindow::previewFdsBlocks()
@@ -8852,12 +9355,16 @@ bool MainWindow::removeObject(const QString& objectId, bool requestConfirmation)
 
 void MainWindow::updateWindowTitle()
 {
+    QString applicationTitle = QStringLiteral("FireCAE");
+#ifdef FIRECAE_BUILD_LABEL
+    applicationTitle += QStringLiteral(" [%1]").arg(QStringLiteral(FIRECAE_BUILD_LABEL));
+#endif
     if (!m_project) {
-        setWindowTitle(QStringLiteral("FireCAE"));
+        setWindowTitle(applicationTitle);
         return;
     }
-    setWindowTitle(QStringLiteral("FireCAE - %1%2")
-                       .arg(m_project->name(),
+    setWindowTitle(QStringLiteral("%1 - %2%3")
+                       .arg(applicationTitle, m_project->name(),
                             m_project->isModified() ? QStringLiteral(" *") : QString()));
 }
 
@@ -8900,11 +9407,16 @@ void MainWindow::resetDefaultLayout()
     }
     if (!m_tutorialGuideWidget || m_tutorialGuideWidget->activeTutorialId().isEmpty())
         m_tutorialGuideDock->hide();
-    m_messagesDock->raise();
+    // Modeling is the default workspace. Saved layouts are restored afterwards;
+    // logs/diagnostics remain available from View and the compact task monitor.
+    for (QDockWidget* dock : {m_messagesDock, m_taskCenterDock,
+                             m_fdsOutputDock, m_resultStatusDock}) dock->hide();
+    if (m_taskCenterWidget) m_taskCenterWidget->setDetailsExpanded(false);
 
     const int sideDockWidth = qBound(kLeftDockMinimumWidth,
                                      qRound(width() * 0.20),
                                      kLeftDockMaximumWidth);
+    const int treeDockWidth = qBound(240, qRound(width() * 0.23), 360);
     const int messagesDockHeight = qBound(kMessagesDockMinimumHeight,
                                           qRound(height() * 0.20),
                                           kMessagesDockMaximumHeight);
@@ -8912,14 +9424,14 @@ void MainWindow::resetDefaultLayout()
                 {messagesDockHeight, messagesDockHeight}, Qt::Vertical);
     resizeDocks({m_modelTreeDock, m_propertiesDock, m_inspectorDock,
                  m_tutorialGuideDock},
-                {sideDockWidth, sideDockWidth, sideDockWidth, sideDockWidth},
+                {treeDockWidth, sideDockWidth, sideDockWidth, sideDockWidth},
                 Qt::Horizontal);
-    QTimer::singleShot(0, this, [this, sideDockWidth, messagesDockHeight, layoutRevision]() {
+    QTimer::singleShot(0, this, [this, treeDockWidth, sideDockWidth, messagesDockHeight, layoutRevision]() {
         // Restoring a saved layout supersedes the initial default sizes.
         if (layoutRevision != m_layoutRevision) return;
         resizeDocks({m_modelTreeDock, m_propertiesDock, m_inspectorDock,
                      m_tutorialGuideDock},
-                    {sideDockWidth, sideDockWidth, sideDockWidth, sideDockWidth},
+                    {treeDockWidth, sideDockWidth, sideDockWidth, sideDockWidth},
                     Qt::Horizontal);
         resizeDocks({m_messagesDock, m_taskCenterDock, m_fdsOutputDock,
                      m_resultStatusDock},
@@ -8986,6 +9498,8 @@ void MainWindow::restoreSavedLayout()
     const QByteArray geometry = settings.value(QStringLiteral("geometry")).toByteArray();
     const QByteArray state = settings.value(QStringLiteral("state")).toByteArray();
     const int workspaceTab = settings.value(QStringLiteral("workspaceTab"), 0).toInt();
+    const QByteArray treeViewState = settings.value(QStringLiteral("modelTreeViewState")).toByteArray();
+    const bool taskDetailsExpanded = settings.value(QStringLiteral("taskDetailsExpanded"), false).toBool();
     settings.endGroup();
 
     if (!geometry.isEmpty()) restoreGeometry(geometry);
@@ -8993,6 +9507,9 @@ void MainWindow::restoreSavedLayout()
         if (restoreState(state, 1)) ++m_layoutRevision;
         else resetDefaultLayout();
     }
+    if (m_modelTreeWidget && !treeViewState.isEmpty())
+        m_modelTreeWidget->restoreViewState(treeViewState);
+    if (m_taskCenterWidget) m_taskCenterWidget->setDetailsExpanded(taskDetailsExpanded);
 
     QScreen* targetScreen = nullptr;
     int largestIntersectionArea = 0;
@@ -9037,6 +9554,10 @@ void MainWindow::saveCurrentLayout()
     settings.beginGroup(QStringLiteral("MainWindow"));
     settings.setValue(QStringLiteral("geometry"), saveGeometry());
     settings.setValue(QStringLiteral("state"), saveState(1));
+    if (m_modelTreeWidget)
+        settings.setValue(QStringLiteral("modelTreeViewState"), m_modelTreeWidget->saveViewState());
+    if (m_taskCenterWidget)
+        settings.setValue(QStringLiteral("taskDetailsExpanded"), m_taskCenterWidget->detailsExpanded());
     settings.setValue(QStringLiteral("workspaceTab"),
                       m_workspaceTabs ? m_workspaceTabs->currentIndex() : 0);
     settings.endGroup();
@@ -9247,6 +9768,7 @@ void MainWindow::retranslateUi()
         {m_rightAction, "Right"}, {m_topAction, "Top"}, {m_bottomAction, "Bottom"},
         {m_isometricAction, "Isometric"}, {m_resetLayoutAction, "Reset Layout"},
         {m_createBoxAction, "Create Box"}, {m_createWallAction, "Create Wall"},
+        {m_directEditAction, "Edit Dimensions in View"},
         {m_drawWallAction, "Draw Wall in View..."},
         {m_createRoomAction, "Create Room"}, {m_importGeometryAction, "Import Geometry"},
         {m_previewFdsBlocksAction, "Preview FDS Blocks..."},
@@ -9334,6 +9856,12 @@ void MainWindow::retranslateUi()
         }
     }
     if (m_mainToolBar) m_mainToolBar->setWindowTitle(u("Main Toolbar"));
+    if (m_modelingToolBar) {
+        m_modelingToolBar->setWindowTitle(u("Modeling Tools"));
+        for(QAction* action:m_modelingToolBar->actions()) {
+            if(!action->isSeparator())action->setToolTip(action->text());
+        }
+    }
     if (m_modelTreeDock) m_modelTreeDock->setWindowTitle(u("Model Tree"));
     if (m_propertiesDock) m_propertiesDock->setWindowTitle(u("Properties"));
     if (m_inspectorDock) m_inspectorDock->setWindowTitle(u("Workspace Inspector"));
@@ -9365,6 +9893,7 @@ void MainWindow::retranslateUi()
             u("The generated FDS input will appear here."));
     }
     if (m_taskCenterWidget) m_taskCenterWidget->retranslateUi();
+    if (m_simulationStatusWidget) m_simulationStatusWidget->retranslateUi();
     if (m_nativeResultViewerWidget) m_nativeResultViewerWidget->retranslateUi();
     if (m_smokeviewHostWidget) m_smokeviewHostWidget->retranslateUi();
     updateSnapStatus();

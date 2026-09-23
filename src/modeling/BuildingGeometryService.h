@@ -49,6 +49,15 @@ struct BuildingGeometryRequest
     FcWallBaseline baseline = FcWallBaseline::Center;
     QVector<QPointF> profile;
     QVector<QPointF> path;
+    // Profile points are in the same world coordinate frame as legacy profile
+    // points. An empty list retains the legacy XY profile + base-Z behavior.
+    QVector<std::array<double, 3>> profile3d;
+    bool extrusionNormal = true;
+    std::array<double, 3> extrusionDirection{0.0, 0.0, 1.0};
+    double extrusionDistance = 3.0;
+    // Preserve appearance, source provenance and exporter options during edits.
+    // Canonical geometry keys take precedence when serializing this request.
+    QVariantMap extraParameters;
 };
 
 struct GeometryFaceInfo

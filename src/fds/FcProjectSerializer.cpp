@@ -28,10 +28,40 @@
 #include <algorithm>
 #include <memory>
 #include <sstream>
+#include <cmath>
 
 namespace
 {
 constexpr auto kFormatName = "FireCAEProject";
+
+QJsonObject ifcAppearanceToJson(const FcIfcAppearance& appearance)
+{
+    return {{QStringLiteral("rgba"), QJsonArray{appearance.red, appearance.green,
+                                               appearance.blue, appearance.alpha}},
+            {QStringLiteral("origin"), appearance.origin == FcIfcAppearanceOrigin::ConvertedSource
+                 ? QStringLiteral("converted-source") : QStringLiteral("type-fallback")},
+            {QStringLiteral("materialName"), appearance.materialName}};
+}
+
+bool ifcAppearanceFromJson(const QJsonValue& value, FcIfcAppearance& appearance)
+{
+    const QJsonObject json = value.toObject();
+    const QJsonArray rgba = json.value(QStringLiteral("rgba")).toArray();
+    if (rgba.size() != 4) return false;
+    for (const QJsonValue& channel : rgba) {
+        const double number = channel.toDouble(-1.0);
+        if (!channel.isDouble() || !std::isfinite(number) || number < 0.0 || number > 1.0)
+            return false;
+    }
+    const QString origin = json.value(QStringLiteral("origin")).toString();
+    if (origin != QStringLiteral("converted-source") && origin != QStringLiteral("type-fallback"))
+        return false;
+    appearance = {rgba[0].toDouble(), rgba[1].toDouble(), rgba[2].toDouble(), rgba[3].toDouble(),
+                  origin == QStringLiteral("converted-source") ? FcIfcAppearanceOrigin::ConvertedSource
+                                                                : FcIfcAppearanceOrigin::TypeFallback,
+                  json.value(QStringLiteral("materialName")).toString()};
+    return true;
+}
 
 QByteArray serializeShape(const TopoDS_Shape& shape)
 {
@@ -323,6 +353,14 @@ QJsonObject serializeObject(const FcObject::Ptr& object)
         json.insert(QStringLiteral("sourceFile"),
                     QDir::fromNativeSeparators(ifc->sourceFile()));
         json.insert(QStringLiteral("schema"), ifc->schema());
+        json.insert(QStringLiteral("ifcAppearance"), ifcAppearanceToJson(ifc->appearance()));
+        QJsonArray faceAppearances;
+        for (auto it = ifc->faceAppearances().cbegin(); it != ifc->faceAppearances().cend(); ++it) {
+            QJsonObject appearance = ifcAppearanceToJson(it.value());
+            appearance.insert(QStringLiteral("faceIndex"), it.key());
+            faceAppearances.append(appearance);
+        }
+        json.insert(QStringLiteral("ifcFaceAppearances"), faceAppearances);
         json.insert(QStringLiteral("fdsConversionRoute"),
                     ifc->fdsConversionRoute());
         if (ifc->hasShape()) {
@@ -512,6 +550,25 @@ FcObject::Ptr deserializeObject(const QJsonObject& json,
                 return {};
             }
             ifc->setShape(shape);
+        }
+        if (json.contains(QStringLiteral("ifcAppearance"))) {
+            FcIfcAppearance appearance;
+            if (!ifcAppearanceFromJson(json.value(QStringLiteral("ifcAppearance")), appearance)) {
+                error = QStringLiteral("IFC object '%1' contains invalid display appearance.").arg(name);
+                return {};
+            }
+            ifc->setAppearance(appearance);
+        }
+        QSet<int> restoredAppearanceFaces;
+        for (const QJsonValue& item : json.value(QStringLiteral("ifcFaceAppearances")).toArray()) {
+            FcIfcAppearance appearance;
+            const int index = item.toObject().value(QStringLiteral("faceIndex")).toInt(-1);
+            if (!ifcAppearanceFromJson(item, appearance) || restoredAppearanceFaces.contains(index) ||
+                !ifc->setFaceAppearance(index, appearance)) {
+                error = QStringLiteral("IFC object '%1' contains an invalid face appearance mapping.").arg(name);
+                return {};
+            }
+            restoredAppearanceFaces.insert(index);
         }
         object = ifc;
     } else if (storageClass == QStringLiteral("Geometry")) {

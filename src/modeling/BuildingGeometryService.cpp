@@ -23,6 +23,7 @@
 #include <TopExp_Explorer.hxx>
 #include <TopExp.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <GProp_GProps.hxx>
 #include <Poly_Triangulation.hxx>
 #include <TopAbs_Orientation.hxx>
@@ -177,6 +178,87 @@ TopoDS_Shape polygonPrism(const QVector<QPointF>& points, double z, double heigh
     return BRepPrimAPI_MakePrism(face.Face(), gp_Vec(0.0, 0.0, height)).Shape();
 }
 
+TopoDS_Shape spatialPolygonPrism(const BuildingGeometryRequest& request, QString* error)
+{
+    const auto fail = [error](const char* message) {
+        setError(error, QString::fromLatin1(message));
+        return TopoDS_Shape{};
+    };
+    QVector<gp_Pnt> points;
+    for (const auto& value : request.profile3d) {
+        if (!std::isfinite(value[0]) || !std::isfinite(value[1]) || !std::isfinite(value[2]))
+            return fail("Profile coordinates must be finite numbers.");
+        points.append(gp_Pnt(value[0], value[1], value[2]));
+    }
+    if (points.size() > 3 && points.first().Distance(points.last()) < kTolerance)
+        points.removeLast();
+    if (points.size() < 3) return fail("A profile needs at least three distinct points.");
+    for (qsizetype i = 0; i < points.size(); ++i)
+        for (qsizetype j = i + 1; j < points.size(); ++j)
+            if (points[i].Distance(points[j]) < kTolerance)
+                return fail("The profile contains duplicate points.");
+    gp_Vec normal;
+    // The area-vector sum respects polygon winding even when the first corner
+    // is concave. A local three-point normal can point the opposite way.
+    for (qsizetype i = 1; i + 1 < points.size(); ++i)
+        normal += gp_Vec(points.first(), points[i]).Crossed(gp_Vec(points.first(), points[i + 1]));
+    if (normal.Magnitude() <= kTolerance)
+        return fail("The profile points must not be collinear.");
+    normal.Normalize();
+    const gp_Vec u = gp_Vec(points.first(), points[1]).Normalized();
+    const gp_Vec v = normal.Crossed(u);
+    QVector<QPointF> plane;
+    for (const gp_Pnt& point : points) {
+        const gp_Vec delta(points.first(), point);
+        if (std::abs(delta.Dot(normal)) > kTolerance * std::max(1.0, delta.Magnitude()))
+            return fail("All profile points must lie on one plane.");
+        plane.append(QPointF(delta.Dot(u), delta.Dot(v)));
+    }
+    const auto cross = [](const QPointF& a, const QPointF& b, const QPointF& c) {
+        return (b.x() - a.x()) * (c.y() - a.y()) -
+               (b.y() - a.y()) * (c.x() - a.x());
+    };
+    const auto onSegment = [&cross](const QPointF& a, const QPointF& b, const QPointF& p) {
+        return std::abs(cross(a, b, p)) <= kTolerance &&
+               p.x() >= std::min(a.x(), b.x()) - kTolerance && p.x() <= std::max(a.x(), b.x()) + kTolerance &&
+               p.y() >= std::min(a.y(), b.y()) - kTolerance && p.y() <= std::max(a.y(), b.y()) + kTolerance;
+    };
+    for (qsizetype i = 0; i < plane.size(); ++i) {
+        const qsizetype inext = (i + 1) % plane.size();
+        for (qsizetype j = i + 1; j < plane.size(); ++j) {
+            const qsizetype jnext = (j + 1) % plane.size();
+            if (inext == j || jnext == i) continue;
+            const auto &a = plane[i], &b = plane[inext], &c = plane[j], &d = plane[jnext];
+            const double c1 = cross(a, b, c), c2 = cross(a, b, d),
+                         c3 = cross(c, d, a), c4 = cross(c, d, b);
+            if ((c1 * c2 < 0 && c3 * c4 < 0) || onSegment(a, b, c) || onSegment(a, b, d) ||
+                onSegment(c, d, a) || onSegment(c, d, b))
+                return fail("The profile must not intersect itself.");
+        }
+    }
+    if (!positive(request.extrusionDistance))
+        return fail("Extrusion distance must be greater than zero.");
+    gp_Vec direction = normal;
+    if (!request.extrusionNormal) {
+        const auto& d = request.extrusionDirection;
+        if (!std::isfinite(d[0]) || !std::isfinite(d[1]) || !std::isfinite(d[2]))
+            return fail("Extrusion direction must contain finite numbers.");
+        direction = gp_Vec(d[0], d[1], d[2]);
+        if (direction.Magnitude() <= kTolerance)
+            return fail("Extrusion direction must not be zero.");
+        direction.Normalize();
+        if (std::abs(direction.Dot(normal)) <= kTolerance)
+            return fail("Extrusion direction must not lie in the profile plane.");
+    }
+    BRepBuilderAPI_MakePolygon polygon;
+    for (const gp_Pnt& point : points) polygon.Add(point);
+    polygon.Close();
+    if (!polygon.IsDone()) return fail("The profile could not be closed.");
+    BRepBuilderAPI_MakeFace face(polygon.Wire(), Standard_True);
+    if (!face.IsDone()) return fail("The profile does not define a planar face.");
+    return BRepPrimAPI_MakePrism(face.Face(), direction * request.extrusionDistance).Shape();
+}
+
 TopoDS_Shape sweptPath(const QVector<QPointF>& points, double z,
                        double thickness, double height,
                        FcWallBaseline baseline)
@@ -268,7 +350,7 @@ QVariantList pointsToVariant(const QVector<QPointF>& points)
 {
     QVariantList result;
     for (const QPointF& point : points) {
-        result.append(QVariantList{point.x(), point.y()});
+        result.append(QVariant(QVariantList{point.x(), point.y()}));
     }
     return result;
 }
@@ -276,7 +358,15 @@ QVariantList pointsToVariant(const QVector<QPointF>& points)
 QVector<QPointF> pointsFromVariant(const QVariant& value)
 {
     QVector<QPointF> result;
-    for (const QVariant& item : value.toList()) {
+    const QVariantList list = value.toList();
+    // Earlier releases appended a QList directly, flattening coordinate pairs.
+    // Accept those archives while writing nested pairs from now on.
+    if (!list.isEmpty() && list.first().metaType().id() != QMetaType::QVariantList) {
+        for (qsizetype index = 0; index + 1 < list.size(); index += 2)
+            result.append(QPointF(list[index].toDouble(), list[index + 1].toDouble()));
+        return result;
+    }
+    for (const QVariant& item : list) {
         const QVariantList pair = item.toList();
         if (pair.size() == 2) result.append(QPointF(pair[0].toDouble(), pair[1].toDouble()));
     }
@@ -324,8 +414,22 @@ TopoDS_Shape BuildingGeometryService::createShape(const BuildingGeometryRequest&
             }
             break;
         case FcGeometryKind::PolygonPrism:
-        case FcGeometryKind::PolygonalOpening:
         case FcGeometryKind::ProfileExtrusion:
+            if (!request.profile3d.isEmpty()) {
+                shape = spatialPolygonPrism(request, error);
+                if (shape.IsNull()) return {};
+            } else {
+                BuildingGeometryRequest spatial = request;
+                for (const QPointF& point : request.profile)
+                    spatial.profile3d.append({point.x(), point.y(), request.z});
+                spatial.extrusionNormal = false;
+                spatial.extrusionDirection = {0.0, 0.0, 1.0};
+                spatial.extrusionDistance = request.height;
+                shape = spatialPolygonPrism(spatial, error);
+                if (shape.IsNull()) return {};
+            }
+            break;
+        case FcGeometryKind::PolygonalOpening:
             shape = polygonPrism(request.profile, request.z, request.height);
             break;
         case FcGeometryKind::Stair:
@@ -380,7 +484,8 @@ TopoDS_Shape BuildingGeometryService::createShape(const BuildingGeometryRequest&
 QVariantMap BuildingGeometryService::requestToParameters(
     const BuildingGeometryRequest& request)
 {
-    return {{QStringLiteral("x"), request.x},
+    QVariantMap parameters = request.extraParameters;
+    const QVariantMap geometry = {{QStringLiteral("x"), request.x},
             {QStringLiteral("y"), request.y},
             {QStringLiteral("z"), request.z},
             {QStringLiteral("endX"), request.endX},
@@ -397,12 +502,24 @@ QVariantMap BuildingGeometryService::requestToParameters(
             {QStringLiteral("baseline"), static_cast<int>(request.baseline)},
             {QStringLiteral("profile"), pointsToVariant(request.profile)},
             {QStringLiteral("path"), pointsToVariant(request.path)}};
+    for (auto item = geometry.cbegin(); item != geometry.cend(); ++item)
+        parameters.insert(item.key(), item.value());
+    QVariantList profile;
+    for (const auto& point : request.profile3d)
+        profile.append(QVariant(QVariantList{point[0], point[1], point[2]}));
+    parameters.insert(QStringLiteral("profile3d"), profile);
+    parameters.insert(QStringLiteral("extrusionNormal"), request.extrusionNormal);
+    parameters.insert(QStringLiteral("extrusionDirection"), QVariantList{
+        request.extrusionDirection[0], request.extrusionDirection[1], request.extrusionDirection[2]});
+    parameters.insert(QStringLiteral("extrusionDistance"), request.extrusionDistance);
+    return parameters;
 }
 
 BuildingGeometryRequest BuildingGeometryService::requestFromParameters(
     FcGeometryKind kind, const QVariantMap& parameters)
 {
     BuildingGeometryRequest request;
+    request.extraParameters = parameters;
     request.kind = kind;
     const auto number = [&parameters](const char* key, double fallback) {
         const QVariant value = parameters.value(QString::fromLatin1(key));
@@ -427,6 +544,15 @@ BuildingGeometryRequest BuildingGeometryService::requestFromParameters(
         parameters.value(QStringLiteral("baseline"), static_cast<int>(request.baseline)).toInt());
     request.profile = pointsFromVariant(parameters.value(QStringLiteral("profile")));
     request.path = pointsFromVariant(parameters.value(QStringLiteral("path")));
+    for (const QVariant& item : parameters.value(QStringLiteral("profile3d")).toList()) {
+        const QVariantList point = item.toList();
+        if (point.size() == 3) request.profile3d.append({point[0].toDouble(), point[1].toDouble(), point[2].toDouble()});
+    }
+    request.extrusionNormal = parameters.value(QStringLiteral("extrusionNormal"), true).toBool();
+    request.extrusionDistance = number("extrusionDistance", request.height);
+    const QVariantList direction = parameters.value(QStringLiteral("extrusionDirection")).toList();
+    if (direction.size() == 3)
+        request.extrusionDirection = {direction[0].toDouble(), direction[1].toDouble(), direction[2].toDouble()};
     return request;
 }
 
@@ -479,8 +605,13 @@ GeometryValidationResult BuildingGeometryService::validate(const TopoDS_Shape& s
         }
 
         QSet<QString> vertexKeys;
-        for (TopExp_Explorer explorer(shape, TopAbs_VERTEX); explorer.More(); explorer.Next()) {
-            const gp_Pnt point = BRep_Tool::Pnt(TopoDS::Vertex(explorer.Current()));
+        // An explorer visits the same shared vertex through each incident
+        // edge/face. Count topological vertices once, otherwise every ordinary
+        // box reports 48 vertices and 40 spurious repair warnings.
+        TopTools_IndexedMapOfShape vertices;
+        TopExp::MapShapes(shape, TopAbs_VERTEX, vertices);
+        for (int index = 1; index <= vertices.Extent(); ++index) {
+            const gp_Pnt point = BRep_Tool::Pnt(TopoDS::Vertex(vertices(index)));
             ++result.vertexCount;
             const QString key = quantizedPointKey(point.X(), point.Y(), point.Z(), 1.0e-7);
             if (vertexKeys.contains(key)) ++result.duplicateVertexCount;

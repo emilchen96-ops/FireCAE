@@ -15,6 +15,11 @@
 #include <TDF_LabelSequence.hxx>
 #include <TDocStd_Document.hxx>
 #include <TopoDS_Compound.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
+#include <XCAFPrs.hxx>
+#include <XCAFPrs_IndexedDataMapOfShapeStyle.hxx>
+#include <XCAFDoc_VisMaterial.hxx>
 #include <XCAFDoc_DocumentTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
 #include <gp_Ax1.hxx>
@@ -276,7 +281,8 @@ void mergeShape(QHash<QString, TopoDS_Shape>* shapes,
 }
 
 void collectNamedShapes(const TDF_Label& label,
-                        QHash<QString, TopoDS_Shape>* shapes)
+                        QHash<QString, TopoDS_Shape>* shapes,
+                        QHash<QString, QVector<TDF_Label>>* labels)
 {
     Handle(TDataStd_Name) nameAttribute;
     if (label.FindAttribute(TDataStd_Name::GetID(), nameAttribute)) {
@@ -284,12 +290,76 @@ void collectNamedShapes(const TDF_Label& label,
         const QString globalId = QString::fromUtf8(name.ToCString());
         if (looksLikeIfcGlobalId(globalId)) {
             mergeShape(shapes, globalId, XCAFDoc_ShapeTool::GetShape(label));
+            (*labels)[globalId].append(label);
         }
     }
 
     for (TDF_ChildIterator iterator(label, Standard_False); iterator.More();
          iterator.Next()) {
-        collectNamedShapes(iterator.Value(), shapes);
+        collectNamedShapes(iterator.Value(), shapes, labels);
+    }
+}
+
+bool sourceAppearance(const XCAFPrs_Style& style, FcIfcAppearance& appearance)
+{
+    Quantity_ColorRGBA color;
+    const Handle(XCAFDoc_VisMaterial)& material = style.Material();
+    if (!material.IsNull() && !material->IsEmpty()) {
+        QString name;
+        if (!material->RawName().IsNull())
+            name = QString::fromUtf8(material->RawName()->ToCString());
+        if (name.isEmpty()) {
+            Handle(TDataStd_Name) attribute;
+            if (material->Label().FindAttribute(TDataStd_Name::GetID(), attribute))
+                name = QString::fromUtf8(TCollection_AsciiString(attribute->Get()).ToCString());
+        }
+        // IfcConvert emits this even when the IFC has no surface style.
+        // Do not misrepresent the converter's neutral grey as source material.
+        if (name.compare(QStringLiteral("DefaultMaterial"), Qt::CaseInsensitive) == 0)
+            return false;
+        color = material->BaseColor();
+        appearance.materialName = name;
+    } else if (style.IsSetColorSurf()) {
+        color = style.GetColorSurfRGBA();
+    } else {
+        return false;
+    }
+    appearance.red = color.GetRGB().Red();
+    appearance.green = color.GetRGB().Green();
+    appearance.blue = color.GetRGB().Blue();
+    appearance.alpha = color.Alpha();
+    appearance.origin = FcIfcAppearanceOrigin::ConvertedSource;
+    return true;
+}
+
+void assignAppearance(const QVector<TDF_Label>& labels, FcIfcObject& object)
+{
+    TopTools_IndexedMapOfShape faces;
+    TopExp::MapShapes(object.shape(), TopAbs_FACE, faces);
+    // Apply containing-shape styles before more specific face styles.
+    struct Assignment { TopoDS_Shape shape; FcIfcAppearance appearance; int count; };
+    QVector<Assignment> assignments;
+    for (const TDF_Label& label : labels) {
+        XCAFPrs_IndexedDataMapOfShapeStyle styles;
+        XCAFPrs::CollectStyleSettings(label, TopLoc_Location(), styles);
+        for (int i = 1; i <= styles.Extent(); ++i) {
+            FcIfcAppearance appearance;
+            if (!sourceAppearance(styles.FindFromIndex(i), appearance)) continue;
+            TopTools_IndexedMapOfShape styledFaces;
+            TopExp::MapShapes(styles.FindKey(i), TopAbs_FACE, styledFaces);
+            assignments.append({styles.FindKey(i), appearance, styledFaces.Extent()});
+        }
+    }
+    std::stable_sort(assignments.begin(), assignments.end(),
+                     [](const Assignment& a, const Assignment& b) { return a.count > b.count; });
+    for (const Assignment& assignment : assignments) {
+        if (assignment.shape.IsSame(object.shape())) object.setAppearance(assignment.appearance);
+        TopTools_IndexedMapOfShape styledFaces;
+        TopExp::MapShapes(assignment.shape, TopAbs_FACE, styledFaces);
+        for (int i = 1; i <= styledFaces.Extent(); ++i) {
+            const int index = faces.FindIndex(styledFaces(i));
+            if (index > 0) object.setFaceAppearance(index, assignment.appearance);
+        }
     }
 }
 
@@ -297,6 +367,7 @@ int assignGlbShapes(const QString& glbPath,
                     const IfcObjectByGlobalId& objects,
                     int* unmatchedGeometryCount,
                     QStringList* unmatchedGeometryIds,
+                    bool preserveMaterials,
                     QString* errorMessage)
 {
     Handle(TDocStd_Document) document = new TDocStd_Document("BinXCAF");
@@ -314,8 +385,9 @@ int assignGlbShapes(const QString& glbPath,
     TDF_LabelSequence roots;
     shapeTool->GetFreeShapes(roots);
     QHash<QString, TopoDS_Shape> shapesByGlobalId;
+    QHash<QString, QVector<TDF_Label>> labelsByGlobalId;
     for (Standard_Integer index = 1; index <= roots.Length(); ++index) {
-        collectNamedShapes(roots.Value(index), &shapesByGlobalId);
+        collectNamedShapes(roots.Value(index), &shapesByGlobalId, &labelsByGlobalId);
     }
 
     int assignedCount = 0;
@@ -329,6 +401,8 @@ int assignGlbShapes(const QString& glbPath,
             continue;
         }
         object.value()->setShape(iterator.value());
+        if (preserveMaterials)
+            assignAppearance(labelsByGlobalId.value(iterator.key()), *object.value());
         ++assignedCount;
     }
     if (unmatchedGeometryCount) {
@@ -410,30 +484,42 @@ void collectIfcShapes(const std::shared_ptr<FcIfcObject>& object,
     }
 }
 
-TopoDS_Shape transformedIfcShape(const TopoDS_Shape& source,
-                                 const IfcImportOptions& options)
+void transformIfcObject(FcIfcObject& object, const gp_Trsf& transform)
 {
-    TopoDS_Shape shape = source;
+    TopTools_IndexedMapOfShape oldFaces;
+    TopExp::MapShapes(object.shape(), TopAbs_FACE, oldFaces);
+    const auto appearances = object.faceAppearances();
+    BRepBuilderAPI_Transform operation(object.shape(), transform, Standard_True, Standard_True);
+    object.setShape(operation.Shape());
+    TopTools_IndexedMapOfShape newFaces;
+    TopExp::MapShapes(object.shape(), TopAbs_FACE, newFaces);
+    for (auto it = appearances.cbegin(); it != appearances.cend(); ++it) {
+        const int index = newFaces.FindIndex(operation.ModifiedShape(oldFaces(it.key())));
+        if (index > 0) object.setFaceAppearance(index, it.value());
+    }
+}
+
+void transformIfcObject(FcIfcObject& object, const IfcImportOptions& options)
+{
     if (std::abs(options.additionalScale - 1.0) > 1.0e-12) {
         gp_Trsf scaling;
         scaling.SetScale(gp_Pnt(0.0, 0.0, 0.0), options.additionalScale);
-        shape = BRepBuilderAPI_Transform(shape, scaling, Standard_True).Shape();
+        transformIfcObject(object, scaling);
     }
     if (options.sourceYAxisUp) {
         gp_Trsf rotation;
         rotation.SetRotation(
             gp_Ax1(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(1.0, 0.0, 0.0)),
             std::acos(-1.0) / 2.0);
-        shape = BRepBuilderAPI_Transform(shape, rotation, Standard_True).Shape();
+        transformIfcObject(object, rotation);
     }
     if (options.originX != 0.0 || options.originY != 0.0 ||
         options.originZ != 0.0) {
         gp_Trsf translation;
         translation.SetTranslation(
             gp_Vec(options.originX, options.originY, options.originZ));
-        shape = BRepBuilderAPI_Transform(shape, translation, Standard_True).Shape();
+        transformIfcObject(object, translation);
     }
-    return shape;
 }
 
 TopoDS_Shape boundingBoxShape(const TopoDS_Shape& source)
@@ -458,12 +544,13 @@ void applyIfcGeometryOptions(const std::shared_ptr<FcIfcObject>& root,
     QVector<std::shared_ptr<FcIfcObject>> shapes;
     collectIfcShapes(root, shapes);
     for (const auto& object : shapes) {
-        TopoDS_Shape shape = transformedIfcShape(object->shape(), options);
+        transformIfcObject(*object, options);
         if (options.simplification.compare(QStringLiteral("BOUNDING_BOX"),
                                            Qt::CaseInsensitive) == 0) {
-            shape = boundingBoxShape(shape);
+            object->setShape(boundingBoxShape(object->shape()));
+            // A box is an approximation with new topology, not the source faces.
+            object->setAppearance(FcIfcObject::typeFallbackAppearance(object->ifcClass()));
         }
-        object->setShape(shape);
         object->setFdsConversionRoute(options.conversionRoute);
     }
 }
@@ -495,17 +582,34 @@ bool filterIfcObject(const std::shared_ptr<FcIfcObject>& object,
 
 void addShapeToCompound(BRep_Builder& builder, TopoDS_Compound& compound,
                         const std::shared_ptr<FcIfcObject>& object,
+                        QVector<QPair<TopoDS_Shape, FcIfcAppearance>>& appearances,
                         bool clearShapes)
 {
     if (!object) return;
     if (object->hasShape()) {
         builder.Add(compound, object->shape());
+        TopTools_IndexedMapOfShape faces;
+        TopExp::MapShapes(object->shape(), TopAbs_FACE, faces);
+        for (int i = 1; i <= faces.Extent(); ++i)
+            appearances.append(qMakePair(faces(i), object->appearanceForFace(i)));
         if (clearShapes) object->clearShape();
     }
     for (const FcObject::Ptr& child : object->children()) {
         addShapeToCompound(builder, compound,
                            std::dynamic_pointer_cast<FcIfcObject>(child),
+                           appearances,
                            clearShapes);
+    }
+}
+
+void applyMergedAppearances(FcIfcObject& object,
+                            const QVector<QPair<TopoDS_Shape, FcIfcAppearance>>& appearances)
+{
+    TopTools_IndexedMapOfShape faces;
+    TopExp::MapShapes(object.shape(), TopAbs_FACE, faces);
+    for (const auto& item : appearances) {
+        const int index = faces.FindIndex(item.first);
+        if (index > 0) object.setFaceAppearance(index, item.second);
     }
 }
 
@@ -518,8 +622,10 @@ int applyMergeStrategy(const std::shared_ptr<FcIfcObject>& root,
         BRep_Builder builder;
         TopoDS_Compound compound;
         builder.MakeCompound(compound);
-        addShapeToCompound(builder, compound, root, true);
+        QVector<QPair<TopoDS_Shape, FcIfcAppearance>> appearances;
+        addShapeToCompound(builder, compound, root, appearances, true);
         root->setShape(compound);
+        applyMergedAppearances(*root, appearances);
         return 1;
     }
     if (strategy.compare(QStringLiteral("MERGE_BY_STOREY"),
@@ -533,12 +639,14 @@ int applyMergeStrategy(const std::shared_ptr<FcIfcObject>& root,
                     BRep_Builder builder;
                     TopoDS_Compound compound;
                     builder.MakeCompound(compound);
+                    QVector<QPair<TopoDS_Shape, FcIfcAppearance>> appearances;
                     for (const FcObject::Ptr& child : object->children()) {
                         addShapeToCompound(
                             builder, compound,
-                            std::dynamic_pointer_cast<FcIfcObject>(child), true);
+                            std::dynamic_pointer_cast<FcIfcObject>(child), appearances, true);
                     }
                     object->setShape(compound);
+                    applyMergedAppearances(*object, appearances);
                     ++storeyShapeCount;
                     return;
                 }
@@ -717,6 +825,7 @@ IfcImportResult IfcImportService::importFile(
     if (stopIfCancelled()) return result;
     result.geometryObjectCount = assignGlbShapes(
         glbPath, objects, &unmatchedGeometryCount, &result.failedComponents,
+        options.preserveMaterials,
         &result.errorMessage);
     if (result.geometryObjectCount == 0) {
         result.rootObject.reset();
@@ -745,6 +854,9 @@ IfcImportResult IfcImportService::importFile(
         return result;
     }
     applyIfcGeometryOptions(result.rootObject, options);
+    if (options.simplification.compare(QStringLiteral("BOUNDING_BOX"), Qt::CaseInsensitive) == 0)
+        result.warnings.append(QStringLiteral(
+            "Bounding-box simplification replaces source faces; IFC type fallback colors are used."));
     applyImportTags(result.rootObject, options, result.preflight);
     result.rootObject->setVisible(options.initiallyVisible);
     result.rootObject->setSchema(
